@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import NavSatFix, Imu
+from std_msgs.msg import Float32, Bool
+from pix_robobus_driver_msgs.msg import VaChassisWheelRpmFb
+from geometry_msgs.msg import TwistWithCovarianceStamped
+
+import csv
+import os
+import sys
+import threading
+import logging
+from datetime import datetime
+
+
+class LocalizationCSVExporter(Node):
+    def __init__(self, outdir=None):
+        super().__init__('localization_csv_exporter')
+
+        # ================= 参数 =================
+        self.declare_parameter("output_directory", "/tmp/localization_data")
+        self.outdir = outdir or self.get_parameter("output_directory").value
+        os.makedirs(self.outdir, exist_ok=True)
+
+        # ================= timeout（ms） =================
+        self.timeout_ms = {
+            "fix": 50,
+            "heading": 50,
+            "imu": 30,
+            "twist": 30,
+            "fused_twist": 40,
+            "wheel_rpm": 40,
+        }
+
+        # ================= 控制 =================
+        self.save_enabled = False
+        self.lock = threading.Lock()
+
+        # ================= 数据缓存 =================
+        self.fix = None
+        self.heading = None
+        self.imu = None
+        self.twist = None
+        self.fused_twist = None
+
+        self.wheel_rpm_lf = 0.0
+        self.wheel_rpm_rf = 0.0
+        self.wheel_rpm_lr = 0.0
+        self.wheel_rpm_rr = 0.0
+
+        # ================= 时间戳 =================
+        self.fix_time = None
+        self.heading_time = None
+        self.imu_time = None
+        self.twist_time = None
+        self.fused_twist_time = None
+        self.wheel_rpm_time = None
+
+        # ================= CSV =================
+        self.csvfile = None
+        self.writer = None
+        self.last_ts = None
+
+        # ================= 日志（每次运行一个文件） =================
+        log_name = f"localization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logging.basicConfig(
+            filename=os.path.join(self.outdir, log_name),
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            force=True
+        )
+        logging.info("Localization CSV Exporter started")
+
+        # ================= 订阅 =================
+        self.create_subscription(NavSatFix, '/sensing/gnss/fix', self.fix_cb, 10)
+        self.create_subscription(Float32, '/sensing/gnss/heading', self.heading_cb, 10)
+        self.create_subscription(Imu, '/sensing/gnss/imu', self.imu_cb, 10)
+        self.create_subscription(
+            VaChassisWheelRpmFb,
+            '/pix_robobus/va_chassis_wheel_rpm_fb',
+            self.wheel_rpm_cb, 10
+        )
+        self.create_subscription(
+            TwistWithCovarianceStamped,
+            '/localization/twist_estimator/twist_with_covariance',
+            self.twist_cb, 10
+        )
+        self.create_subscription(
+            TwistWithCovarianceStamped,
+            '/sensing/vehicle_velocity_converter/twist_with_covariance',
+            self.fused_twist_cb, 10
+        )
+        self.create_subscription(
+            Bool,
+            '/sensing_data_recorder/enable_save_1',
+            self.enable_save_cb, 10
+        )
+
+        # ================= 定时器 =================
+        self.create_timer(0.01, self.timer_write_csv)  # 100 Hz
+
+    # =====================================================
+    # 工具函数
+    # =====================================================
+    def is_valid(self, name, last_time, timeout_ms):
+        if last_time is None:
+            self.get_logger().warn(
+                f"[{name}] no data",
+                throttle_duration_sec=1.0
+            )
+            return False
+
+        dt = (self.get_clock().now() - last_time).nanoseconds / 1e6
+        if dt > timeout_ms:
+            self.get_logger().warn(
+                f"[{name}] timeout {dt:.1f} ms > {timeout_ms} ms",
+                throttle_duration_sec=1.0
+            )
+            return False
+        return True
+
+    def v(self, ok, value):
+        return value if ok else "*"
+
+    # =====================================================
+    # 回调
+    # =====================================================
+    def fix_cb(self, msg):
+        with self.lock:
+            self.fix = msg
+            self.fix_time = self.get_clock().now()
+
+    def heading_cb(self, msg):
+        with self.lock:
+            self.heading = msg.data
+            self.heading_time = self.get_clock().now()
+
+    def imu_cb(self, msg):
+        with self.lock:
+            self.imu = msg
+            self.imu_time = self.get_clock().now()
+
+    def twist_cb(self, msg):
+        with self.lock:
+            self.twist = msg
+            self.twist_time = self.get_clock().now()
+
+    def fused_twist_cb(self, msg):
+        with self.lock:
+            self.fused_twist = msg
+            self.fused_twist_time = self.get_clock().now()
+
+    def wheel_rpm_cb(self, msg):
+        with self.lock:
+            self.wheel_rpm_lf = msg.vcu_chassis_wheel_rpm_lf
+            self.wheel_rpm_rf = msg.vcu_chassis_wheel_rpm_rf
+            self.wheel_rpm_lr = msg.vcu_chassis_wheel_rpm_lr
+            self.wheel_rpm_rr = msg.vcu_chassis_wheel_rpm_rr
+            self.wheel_rpm_time = self.get_clock().now()
+
+    # =====================================================
+    # CSV 控制
+    # =====================================================
+    def enable_save_cb(self, msg):
+        if msg.data and not self.save_enabled:
+            self.save_enabled = True
+            self.init_csv()
+            self.get_logger().info("CSV recording started")
+
+        elif not msg.data and self.save_enabled:
+            self.save_enabled = False
+            self.close_csv()
+            self.get_logger().info("CSV recording stopped")
+
+    def init_csv(self):
+        csv_name = f"localization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = os.path.join(self.outdir, csv_name)
+        self.csvfile = open(path, "w", newline="", buffering=1)
+        self.writer = csv.writer(self.csvfile)
+        self.writer.writerow([
+            "timestamp_s",
+            "lat", "lon", "alt", "heading",
+            "vx", "vy", "vz",
+            "imu_wx", "imu_wy", "imu_wz",
+            "ax", "ay", "az",
+            "wheel_rpm_lf", "wheel_rpm_rf", "wheel_rpm_lr", "wheel_rpm_rr",
+            "twist_wx", "twist_wy", "twist_wz",
+            "fused_vx", "fused_vy", "fused_vz",
+            "fused_wx", "fused_wy", "fused_wz"
+        ])
+
+    def close_csv(self):
+        if self.csvfile:
+            self.csvfile.close()
+            self.csvfile = None
+            self.writer = None
+
+    # =====================================================
+    # 主循环（永远写一行）
+    # =====================================================
+    def timer_write_csv(self):
+        with self.lock:
+            if not self.save_enabled or not self.writer or not self.fix:
+                return
+
+            fix_ok     = self.is_valid("fix", self.fix_time, self.timeout_ms["fix"])
+            heading_ok = self.is_valid("heading", self.heading_time, self.timeout_ms["heading"])
+            imu_ok     = self.is_valid("imu", self.imu_time, self.timeout_ms["imu"])
+            twist_ok   = self.is_valid("twist", self.twist_time, self.timeout_ms["twist"])
+            fused_ok   = self.is_valid("fused_twist", self.fused_twist_time, self.timeout_ms["fused_twist"])
+            wheel_ok   = self.is_valid("wheel_rpm", self.wheel_rpm_time, self.timeout_ms["wheel_rpm"])
+
+            t = self.fix.header.stamp
+            ts = round(t.sec + t.nanosec * 1e-9, 4)
+            if ts == self.last_ts:
+                return
+            self.last_ts = ts
+
+            lin = self.twist.twist.twist.linear if twist_ok else None
+            ang = self.twist.twist.twist.angular if twist_ok else None
+            w = self.imu.angular_velocity if imu_ok else None
+            a = self.imu.linear_acceleration if imu_ok else None
+            fl = self.fused_twist.twist.twist.linear if fused_ok else None
+            fa = self.fused_twist.twist.twist.angular if fused_ok else None
+
+            self.writer.writerow([
+                ts,
+                self.v(fix_ok, self.fix.latitude),
+                self.v(fix_ok, self.fix.longitude),
+                self.v(fix_ok, self.fix.altitude),
+                self.v(heading_ok, self.heading),
+
+                self.v(twist_ok, lin.x if lin else None),
+                self.v(twist_ok, lin.y if lin else None),
+                self.v(twist_ok, lin.z if lin else None),
+
+                self.v(imu_ok, w.x if w else None),
+                self.v(imu_ok, w.y if w else None),
+                self.v(imu_ok, w.z if w else None),
+
+                self.v(imu_ok, a.x if a else None),
+                self.v(imu_ok, a.y if a else None),
+                self.v(imu_ok, a.z if a else None),
+
+                self.v(wheel_ok, self.wheel_rpm_lf),
+                self.v(wheel_ok, self.wheel_rpm_rf),
+                self.v(wheel_ok, self.wheel_rpm_lr),
+                self.v(wheel_ok, self.wheel_rpm_rr),
+
+                self.v(twist_ok, ang.x if ang else None),
+                self.v(twist_ok, ang.y if ang else None),
+                self.v(twist_ok, ang.z if ang else None),
+
+                self.v(fused_ok, fl.x if fl else None),
+                self.v(fused_ok, fl.y if fl else None),
+                self.v(fused_ok, fl.z if fl else None),
+                self.v(fused_ok, fa.x if fa else None),
+                self.v(fused_ok, fa.y if fa else None),
+                self.v(fused_ok, fa.z if fa else None),
+            ])
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    outdir = sys.argv[1] if len(sys.argv) > 1 else None
+    node = LocalizationCSVExporter(outdir)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.close_csv()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
