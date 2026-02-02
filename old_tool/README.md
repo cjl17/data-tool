@@ -2,6 +2,16 @@
 
 本目录包含旧版的数据处理工具脚本，主要用于相机标定、坐标变换计算和 ROS2 定位数据导出。
 
+## 快速索引
+
+| 工具 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `convert_to_tencent_format.py` | 相机标定格式转换 | YAML 文件 | JSON 文件 |
+| `generate_extrinsics.py` | 生成相机外参矩阵 | 相机编号 + JSON | 更新 JSON 文件 |
+| `db3_to_yaml.py` | ROS2 Bag 转 YAML | db3 bag 文件 | YAML 文件目录 |
+| `rename_with_timestamp.py` | 批量文件重命名 | 文件夹路径 | 重命名后的文件 |
+| `localization_exporter.py` | 实时定位数据导出 | ROS2 话题 | CSV 文件 |
+
 ## 工具列表
 
 ### 1. `convert_to_tencent_format.py` - 相机标定格式转换工具
@@ -156,7 +166,44 @@ velCov: [9个协方差值]
 
 ---
 
-### 4. `localization_exporter.py` - ROS2 实时定位数据导出工具
+### 4. `rename_with_timestamp.py` - 批量文件重命名工具
+
+**功能**：按顺序批量重命名指定文件夹中的所有文件
+
+**特性**：
+- 默认起始编号：`175636611607`
+- 默认步长：`10`
+- 后缀统一为 `.jpg`
+- 执行后文件示例：`175636611607.jpg`, `175636611617.jpg`, `175636611627.jpg`, ...
+
+**使用方法**：
+```bash
+python3 rename_with_timestamp.py /path/to/folder
+```
+
+**参数说明**：
+- `/path/to/folder`：要重命名的文件夹路径
+
+**配置修改**：
+在代码顶部可直接更改：
+```python
+start_index = 175636611607  # 起始编号
+step = 10                   # 递增步长
+```
+
+**执行流程**：
+1. 临时重命名：将每个文件改名为 `原名_tmp.ext`，避免覆盖冲突
+2. 正式重命名：按顺序改为 `<编号>.jpg`
+
+**注意事项**：
+- ⚠️ **强烈建议先备份文件**
+- 脚本对文件字典序排序后重命名
+- 包含子目录会报错
+- 所有文件统一重命名为 `.jpg` 后缀
+
+---
+
+### 5. `localization_exporter.py` - ROS2 实时定位数据导出工具
 
 **功能**：ROS2 节点，实时订阅定位话题并记录到 CSV 文件
 
@@ -245,6 +292,7 @@ old_tool/
 ├── convert_to_tencent_format.py   # 相机标定格式转换工具
 ├── generate_extrinsics.py         # 相机外参变换矩阵生成工具
 ├── db3_to_yaml.py                 # ROS2 Bag 转 YAML 工具
+├── rename_with_timestamp.py       # 批量文件重命名工具
 └── localization_exporter.py       # ROS2 实时定位数据导出工具
 ```
 
