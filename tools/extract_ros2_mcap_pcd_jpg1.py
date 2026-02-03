@@ -439,10 +439,14 @@ def export_bag(
 
                     stamp_ns = _stamp_to_ns(msg.header.stamp) if getattr(msg, "header", None) else int(t_ns_epoch)
                     stamp_ms = _stamp_to_ms(stamp_ns)
-                    fn = f"{stamp_ms:013d}_{idx:05d}{ext}"
+                    fn = f"{stamp_ms:013d}{ext}"
                     out_path = topic_dir / fn
-                    if out_path.exists() and not overwrite:
-                        continue
+                    if out_path.exists():
+                        _log(f"[WARNING] Duplicate timestamp {stamp_ms:013d} for topic {conn.topic}: {out_path}", quiet=quiet)
+                        if not overwrite:
+                            continue
+                        else:
+                            _log(f"[INFO] Overwriting existing file: {out_path}", quiet=quiet)
                     # msg.data is bytes-like (often array('B')); avoid copy via memoryview.
                     with out_path.open("wb") as f:
                         f.write(memoryview(msg.data))
@@ -461,10 +465,14 @@ def export_bag(
 
                     stamp_ns = _stamp_to_ns(msg.header.stamp) if getattr(msg, "header", None) else int(t_ns_epoch)
                     stamp_ms = _stamp_to_ms(stamp_ns)
-                    fn = f"{stamp_ms:013d}_{idx:05d}.pcd"
+                    fn = f"{stamp_ms:013d}.pcd"
                     out_path = topic_dir / fn
-                    if out_path.exists() and not overwrite:
-                        continue
+                    if out_path.exists():
+                        _log(f"[WARNING] Duplicate timestamp {stamp_ms:013d} for topic {conn.topic}: {out_path}", quiet=quiet)
+                        if not overwrite:
+                            continue
+                        else:
+                            _log(f"[INFO] Overwriting existing file: {out_path}", quiet=quiet)
 
                     # Build PCD schema from PointCloud2 fields
                     fields = []

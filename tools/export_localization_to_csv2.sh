@@ -332,47 +332,53 @@ def main():
     # 初始化ROS2节点
     rclpy.init()
     
-    # 创建输出目录
-    output_dir = "/media/ipc/AQLoopCloseData1/perception_csv"
-    node = LocalizationCSVExporter(outdir=output_dir)
+    # ----------------- 参数解析 -----------------
+    mcap_input = None
+    if len(sys.argv) > 1:
+        mcap_input = sys.argv[1]
+
+    # ----------------- 生成输出目录 -----------------
+    if mcap_input:
+        # 取最后一级目录名
+        base_name = os.path.basename(mcap_input.rstrip("/"))
+        # 输出目录放在 MCAP 文件所在目录旁
+        parent_dir = os.path.dirname(os.path.abspath(mcap_input))
+        output_dir = os.path.join(parent_dir, f"{base_name}_csv")
+    else:
+        parent_dir = os.path.dirname(os.path.abspath(DEFAULT_MCAP_DIR))
+        output_dir = os.path.join(parent_dir, "perception_csv")
     
+    node = LocalizationCSVExporter(outdir=output_dir)
     print(f"Output directory: {output_dir}")
     
-    # ----------------- 参数解析 -----------------
-    if len(sys.argv) > 1:
-        # 支持传入多个 MCAP 文件或目录
-        mcap_files = []
-        for arg in sys.argv[1:]:
-            if os.path.isdir(arg):
-                # 递归查找所有MCAP文件
-                found = glob.glob(os.path.join(arg, "**", "*.mcap"), recursive=True)
-                if not found:
-                    found = glob.glob(os.path.join(arg, "*.mcap"))
-                if found:
-                    mcap_files.extend(found)
-                    print(f"Found {len(found)} MCAP files in directory: {arg}")
-                else:
-                    print(f"No MCAP files found in directory: {arg}")
-            elif os.path.isfile(arg) and arg.endswith('.mcap'):
-                mcap_files.append(arg)
-                print(f"Added MCAP file: {arg}")
+    # ----------------- 查找 MCAP 文件 -----------------
+    mcap_files = []
+    if mcap_input:
+        if os.path.isdir(mcap_input):
+            # 递归查找所有MCAP文件
+            found = glob.glob(os.path.join(mcap_input, "**", "*.mcap"), recursive=True)
+            if not found:
+                found = glob.glob(os.path.join(mcap_input, "*.mcap"))
+            if found:
+                mcap_files.extend(found)
+                print(f"Found {len(found)} MCAP files in directory: {mcap_input}")
             else:
-                print(f"Warning: Invalid argument (not a directory or .mcap file): {arg}")
+                print(f"No MCAP files found in directory: {mcap_input}")
+        elif os.path.isfile(mcap_input) and mcap_input.endswith('.mcap'):
+            mcap_files.append(mcap_input)
+            print(f"Added MCAP file: {mcap_input}")
+        else:
+            print(f"Warning: Invalid argument (not a directory or .mcap file): {mcap_input}")
     else:
         # 默认扫描目录
         print(f"Using default directory: {DEFAULT_MCAP_DIR}")
         mcap_files = glob.glob(os.path.join(DEFAULT_MCAP_DIR, "*.mcap"))
         if not mcap_files:
-            # 尝试递归查找
             mcap_files = glob.glob(os.path.join(DEFAULT_MCAP_DIR, "**", "*.mcap"), recursive=True)
 
-    # 检查是否有文件
+    # ----------------- 检查是否有文件 -----------------
     if not mcap_files:
         print("No MCAP files found.")
-        print("Usage:")
-        print("  python3 script.py [mcap_file1] [mcap_file2] ...")
-        print("  python3 script.py [directory_containing_mcap_files]")
-        print("  python3 script.py  (uses default directory)")
         node.destroy_node()
         rclpy.shutdown()
         return
