@@ -9,8 +9,9 @@ data-tool/
 ├── README.md                    # 本文件（总览）
 ├── tools/                       # 新版工具集（推荐使用）
 │   ├── README.md               # 工具集详细说明
-│   ├── extract_ros2_mcap_pcd_jpg.py          # MCAP 数据导出工具
-│   ├── export_localization_to_csv.py.sh      # 定位数据导出工具
+│   ├── extract_ros2_mcap_pcd_jpg1.py         # MCAP 数据导出工具
+│   ├── 2hzduiqi.py                            # 点云和相机数据匹配与预处理
+│   ├── export_localization_to_csv2.sh         # 定位数据导出工具
 │   ├── analyze_localization_quality.sh        # 定位数据质量分析
 │   ├── check_pcd.py                          # PCD/JPG 连续性检查
 │   └── ...
@@ -37,13 +38,16 @@ data-tool/
 
 **快速使用**：
 ```bash
-# 1. 导出图像和点云
-python3 tools/extract_ros2_mcap_pcd_jpg.py /path/to/perception_data_20260129113410 --jobs 8
+# 1. 导出图像和点云（从 MCAP 文件）
+python3 tools/extract_ros2_mcap_pcd_jpg1.py /path/to/perception_data_20260129113410 --jobs 8
 
-# 2. 导出定位数据（每个 MCAP 一个 CSV）
-python3 tools/export_localization_to_csv.py.sh /path/to/perception_data_20260129113410
+# 2. 匹配点云和相机数据，生成训练序列
+python3 tools/2hzduiqi.py /media/ipc/AQLoopCloseData2
 
-# 3. 分析定位数据质量
+# 3. 导出定位数据（每个 MCAP 一个 CSV）
+bash tools/export_localization_to_csv2.sh /path/to/perception_data_20260129113410
+
+# 4. 分析定位数据质量
 ./tools/analyze_localization_quality.sh /media/ipc/AQLoopCloseData1/perception_csv
 ```
 
@@ -100,21 +104,26 @@ python3 old_tool/db3_to_yaml.py /path/to/rosbag.db3
 
 ```bash
 # 1. 从 MCAP 导出图像和点云
-python3 tools/extract_ros2_mcap_pcd_jpg.py \
+python3 tools/extract_ros2_mcap_pcd_jpg1.py \
   /path/to/perception_data_20260129113410 \
   --jobs 8
+# 输出到: /path/to/perception_data_20260129113410/raw_data/
 
-# 2. 导出定位数据到 CSV（每个 MCAP 一个 CSV）
-python3 tools/export_localization_to_csv.py.sh \
+# 2. 匹配点云和相机数据，生成训练序列
+python3 tools/2hzduiqi.py /media/ipc/AQLoopCloseData2
+# 输出到: /media/ipc/AQLoopCloseData2/ok_data/ 和 ok_data_2hz/
+
+# 3. 导出定位数据到 CSV（每个 MCAP 一个 CSV）
+bash tools/export_localization_to_csv2.sh \
   /path/to/perception_data_20260129113410
 
-# 3. 分析定位数据质量
+# 4. 分析定位数据质量
 ./tools/analyze_localization_quality.sh \
   /media/ipc/AQLoopCloseData1/perception_csv
 
-# 4. 检查导出的 PCD/JPG 连续性
+# 5. 检查导出的 PCD/JPG 连续性
 python3 tools/check_pcd.py \
-  /path/to/perception_data_20260129113410/export_pcd_jpg
+  /path/to/perception_data_20260129113410/raw_data
 ```
 
 ### 场景 2：相机标定数据处理

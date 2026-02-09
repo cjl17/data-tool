@@ -3,17 +3,20 @@
 Check exported JPG/PCD continuity (timestamp/index) from tools/extract_ros2_mcap_pcd_jpg.py output.
 
 Assumes filenames like:
-  <stamp_ms>_<idx>.jpg
-  <stamp_ms>_<idx>.pcd
+  <stamp_ms>_<idx>.jpg (with index)
+  <stamp_ms>.jpg (without index)
+  <stamp_ms>_<idx>.pcd (with index)
+  <stamp_ms>.pcd (without index)
 
 It scans:
   <export_dir>/images/*/*.(jpg|png|webp|tif|bin)
   <export_dir>/pcd/*/*.pcd
+  Or nested: <export_dir>/*/images/*/* and <export_dir>/*/pcd/*/*.pcd
 
 And reports per subfolder:
   - count
   - timestamp monotonicity violations
-  - missing index gaps
+  - missing index gaps (if index present)
   - large timestamp gaps (potential dropped frames) based on median dt
 """
 
@@ -29,17 +32,20 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-FNAME_RE = re.compile(r"^(?P<ts>\d+)_(?P<idx>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
+# Support both formats: <ts>_<idx>.ext and <ts>.ext
+FNAME_RE_WITH_IDX = re.compile(r"^(?P<ts>\d+)_(?P<idx>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
+FNAME_RE_NO_IDX = re.compile(r"^(?P<ts>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
 
 
 @dataclass(frozen=True)
 class Frame:
     ts_ms: int
-    idx: int
+    idx: Optional[int]  # None if no index in filename
     path: Path
 
 
 def _iter_files(export_dir: Path) -> Iterable[Path]:
+    # Try direct structure: export_dir/images/*/* and export_dir/pcd/*/*.pcd
     images = export_dir / "images"
     pcd = export_dir / "pcd"
     if images.is_dir():
@@ -48,18 +54,40 @@ def _iter_files(export_dir: Path) -> Iterable[Path]:
     if pcd.is_dir():
         # pcd/<topic_dir>/*.pcd
         yield from pcd.glob("*/*.pcd")
+    
+    # Try nested structure: export_dir/*/images/*/* and export_dir/*/pcd/*/*.pcd
+    for subdir in export_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        nested_images = subdir / "images"
+        nested_pcd = subdir / "pcd"
+        if nested_images.is_dir():
+            yield from nested_images.glob("*/*")
+        if nested_pcd.is_dir():
+            yield from nested_pcd.glob("*/*.pcd")
 
 
 def _parse_frame(p: Path) -> Optional[Frame]:
-    m = FNAME_RE.match(p.name)
-    if not m:
-        return None
-    try:
-        ts_ms = int(m.group("ts"))
-        idx = int(m.group("idx"))
-    except ValueError:
-        return None
-    return Frame(ts_ms=ts_ms, idx=idx, path=p)
+    # Try format with index first
+    m = FNAME_RE_WITH_IDX.match(p.name)
+    if m:
+        try:
+            ts_ms = int(m.group("ts"))
+            idx = int(m.group("idx"))
+            return Frame(ts_ms=ts_ms, idx=idx, path=p)
+        except ValueError:
+            return None
+    
+    # Try format without index
+    m = FNAME_RE_NO_IDX.match(p.name)
+    if m:
+        try:
+            ts_ms = int(m.group("ts"))
+            return Frame(ts_ms=ts_ms, idx=None, path=p)
+        except ValueError:
+            return None
+    
+    return None
 
 
 def _median_int(values: list[int]) -> Optional[int]:
@@ -83,7 +111,7 @@ def analyze_folder(
         if fr:
             frames.append(fr)
 
-    frames.sort(key=lambda f: (f.ts_ms, f.idx, f.path.name))
+    frames.sort(key=lambda f: (f.ts_ms, f.idx if f.idx is not None else 0, f.path.name))
     n = len(frames)
     if n < 2:
         return {
@@ -112,11 +140,13 @@ def analyze_folder(
                 non_mono_examples.append(f"{a.path.name} -> {b.path.name} (dt_ms={dt})")
         # Index gaps should be checked between consecutive frames (in time order),
         # since that's what "dropped frames" means operationally.
-        d_idx = b.idx - a.idx
-        if d_idx > 1:
-            idx_gaps += (d_idx - 1)
-            if len(idx_gap_examples) < max_examples:
-                idx_gap_examples.append(f"missing {a.idx + 1}..{b.idx - 1} between {a.path.name} and {b.path.name}")
+        # Only check if both frames have indices
+        if a.idx is not None and b.idx is not None:
+            d_idx = b.idx - a.idx
+            if d_idx > 1:
+                idx_gaps += (d_idx - 1)
+                if len(idx_gap_examples) < max_examples:
+                    idx_gap_examples.append(f"missing {a.idx + 1}..{b.idx - 1} between {a.path.name} and {b.path.name}")
 
     med_dt = expected_dt_ms if expected_dt_ms is not None else _median_int([dt for dt in dts if dt >= 0])
     est_fps = (1000.0 / med_dt) if med_dt and med_dt > 0 else None
@@ -194,7 +224,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             groups.setdefault(f.parent, []).append(f)
 
     if not groups:
-        print(f"[ERROR] No files found under {export_dir}/images/* or {export_dir}/pcd/*", file=sys.stderr)
+        print(f"[ERROR] No files found under {export_dir}/images/* or {export_dir}/pcd/* or {export_dir}/*/images/* or {export_dir}/*/pcd/*", file=sys.stderr)
         return 2
 
     report = {

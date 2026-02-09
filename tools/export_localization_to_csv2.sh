@@ -32,12 +32,12 @@ class LocalizationCSVExporter(Node):
 
         # ================= timeout（ms） =================
         self.timeout_ms = {
-            "fix": 50,
-            "heading": 50,
-            "imu": 30,
-            "twist": 30,
-            "fused_twist": 40,
-            "wheel_rpm": 40,
+            "fix": 200,
+            "heading": 200,
+            "imu": 100,
+            "twist": 150,
+            "fused_twist": 200,
+            "wheel_rpm": 200,
         }
 
         # ================= 控制 =================
