@@ -19,9 +19,82 @@ import threading
 import logging
 from datetime import datetime
 import glob
+import re
 
 
-DEFAULT_MCAP_DIR = "/media/ipc/AQLoopCloseData1/perception_data_20260129133840"  # 默认扫描目录
+DEFAULT_MCAP_DIR = "/media/ipc/AQLoopCloseData2/perception_data_20260205125341"  # 默认扫描目录
+
+
+# ----------------- 辅助函数 -----------------
+def find_first_dir_and_perception_dir(mcap_file_path):
+    """
+    根据mcap文件路径，找到对应的first*目录和perception_data_*目录
+    从mcap文件名中提取时间戳和序号
+    返回: (first_dir_path, perception_dir_path, perception_index) 或 (None, None, None)
+    """
+    mcap_file_path = os.path.abspath(mcap_file_path)
+    mcap_dir = os.path.dirname(mcap_file_path)
+    mcap_name = os.path.basename(mcap_file_path)
+    
+    # 从mcap文件名中提取时间戳和序号
+    # 格式: perception_data_{timestamp}_{index}.mcap
+    timestamp = None
+    perception_index = None
+    
+    # 从文件名提取
+    match = re.search(r'perception_data_(\d+)_(\d+)\.mcap', mcap_name)
+    if match:
+        timestamp = match.group(1)
+        perception_index = match.group(2)
+    else:
+        # 如果文件名格式不匹配，尝试从目录名提取时间戳
+        parent_dir = os.path.basename(mcap_dir)
+        match = re.search(r'perception_data_(\d+)', parent_dir)
+        if match:
+            timestamp = match.group(1)
+    
+    if not timestamp:
+        # 如果无法提取，尝试从DEFAULT_MCAP_DIR提取
+        match = re.search(r'perception_data_(\d+)', DEFAULT_MCAP_DIR)
+        if match:
+            timestamp = match.group(1)
+    
+    if not timestamp:
+        return (None, None, None)
+    
+    # 找到AQLoopCloseData2目录
+    aq_dir = None
+    path_parts = mcap_file_path.split(os.sep)
+    if 'AQLoopCloseData2' in path_parts:
+        idx = path_parts.index('AQLoopCloseData2')
+        aq_dir = os.sep.join(path_parts[:idx+1])
+    
+    if not aq_dir or not os.path.exists(aq_dir):
+        return (None, None, None)
+    
+    # 查找first*目录
+    first_dir_name = f"first_{timestamp}"
+    first_dir = os.path.join(aq_dir, first_dir_name)
+    
+    if not os.path.exists(first_dir):
+        return (None, None, perception_index)
+    
+    # 如果无法从文件名提取序号，返回None
+    if perception_index is None:
+        return (first_dir, None, None)
+    
+    perception_dir_name = f"perception_data_{timestamp}_{perception_index}"
+    perception_dir = os.path.join(first_dir, perception_dir_name)
+    
+    # 如果目录不存在，创建它
+    if not os.path.exists(perception_dir):
+        try:
+            os.makedirs(perception_dir, exist_ok=True)
+        except Exception as e:
+            logging.warning(f"Failed to create directory {perception_dir}: {e}")
+            return (first_dir, None, perception_index)
+    
+    return (first_dir, perception_dir, perception_index)
 
 # ----------------- LocalizationCSVExporter -----------------
 class LocalizationCSVExporter(Node):
@@ -131,13 +204,37 @@ class LocalizationCSVExporter(Node):
         self.wheel_rpm_time = t
 
     # ----------------- CSV -----------------
-    def init_csv(self, mcap_file_name):
+    def init_csv(self, mcap_file_name, file_index):
         """初始化CSV文件，重置状态"""
         # 重置所有状态，确保文件处理独立
         self.reset_state()
         
-        csv_name = f"{os.path.basename(mcap_file_name).replace('.mcap','')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        path = os.path.join(self.outdir, csv_name)
+        # 从mcap文件名中提取序号
+        first_dir, perception_dir, perception_index = find_first_dir_and_perception_dir(mcap_file_name)
+        
+        # 使用从mcap文件名提取的序号，如果提取失败则使用file_index-1作为回退
+        if perception_index is not None:
+            csv_index = perception_index
+        else:
+            csv_index = file_index - 1
+        
+        csv_name = f"localization_{csv_index}.csv"
+        
+        if perception_dir:
+            # 输出到对应的perception_data_*目录
+            path = os.path.join(perception_dir, csv_name)
+            logging.info(f"Output to perception_data directory: {perception_dir}")
+            print(f"  Output CSV: {perception_dir}/{csv_name}")
+        else:
+            # 回退到原来的输出目录
+            path = os.path.join(self.outdir, csv_name)
+            logging.warning(f"Could not find perception_data directory, using default: {self.outdir}")
+            print(f"  Output CSV: {csv_name} (default directory)")
+        
+        # 确保目录存在
+        csv_dir = os.path.dirname(path)
+        os.makedirs(csv_dir, exist_ok=True)
+        
         self.csvfile = open(path, "w", newline="", buffering=1)
         self.writer = csv.writer(self.csvfile)
         self.writer.writerow([
@@ -151,8 +248,7 @@ class LocalizationCSVExporter(Node):
             "fused_vx", "fused_vy", "fused_vz",
             "fused_wx", "fused_wy", "fused_wz"
         ])
-        logging.info(f"Processing MCAP: {mcap_file_name} -> CSV: {csv_name}")
-        print(f"  Output CSV: {csv_name}")
+        logging.info(f"Processing MCAP: {mcap_file_name} -> CSV: {path}")
 
     def close_csv(self):
         if self.csvfile:
@@ -175,6 +271,7 @@ class LocalizationCSVExporter(Node):
 
         t = self.fix.header.stamp
         ts = round(t.sec + t.nanosec * 1e-9, 4)
+        ts_formatted = f"{ts:.4f}"
         
         # 检查时间戳连续性
         if self.last_ts is not None:
@@ -206,7 +303,7 @@ class LocalizationCSVExporter(Node):
         fa = self.fused_twist.twist.twist.angular if fused_ok else None
 
         self.writer.writerow([
-            ts,
+            ts_formatted,
             self.v(fix_ok, self.fix.latitude),
             self.v(fix_ok, self.fix.longitude),
             self.v(fix_ok, self.fix.altitude),
@@ -243,7 +340,7 @@ class LocalizationCSVExporter(Node):
 
 
 # ----------------- 主程序 -----------------
-def process_mcap_file(node, mcap_file):
+def process_mcap_file(node, mcap_file, file_index):
     """处理单个MCAP文件"""
     try:
         print(f"  Opening MCAP: {os.path.basename(mcap_file)}")
@@ -268,7 +365,7 @@ def process_mcap_file(node, mcap_file):
             logging.warning(f"Failed to get topic types for {mcap_file}: {e}")
 
         # 初始化CSV（内部会重置所有状态）
-        node.init_csv(mcap_file)
+        node.init_csv(mcap_file, file_index)
 
         # 处理消息
         msg_count = 0
@@ -396,7 +493,7 @@ def main():
         print(f"\n[{i}/{total_files}] Processing {os.path.basename(f)} ...")
         logging.info(f"=== Start processing {os.path.basename(f)} ({i}/{total_files}) ===")
         
-        process_mcap_file(node, f)
+        process_mcap_file(node, f, i)
         
         print(f"[{i}/{total_files}] Completed {os.path.basename(f)}")
         logging.info(f"=== Finished processing {os.path.basename(f)} ===")
