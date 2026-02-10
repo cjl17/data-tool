@@ -14,6 +14,9 @@ data-tool/
 │   ├── export_localization_to_csv2.sh         # 定位数据导出工具
 │   ├── analyze_localization_quality.sh        # 定位数据质量分析
 │   ├── check_pcd.py                          # PCD/JPG 连续性检查
+│   ├── pc_projection.py                      # 点云投影到相机图像
+│   ├── copy-keyframe.sh                      # 拷贝关键帧数据（ok_data_2hz）
+│   ├── copy-sweep.sh                         # 拷贝 sweep 数据（ok_data）
 │   └── ...
 └── old_tool/                    # 旧版工具集（兼容性保留）
     ├── README.md               # 旧工具详细说明
@@ -49,6 +52,15 @@ bash tools/export_localization_to_csv2.sh /path/to/perception_data_2026012911341
 
 # 4. 分析定位数据质量
 ./tools/analyze_localization_quality.sh /media/ipc/AQLoopCloseData1/perception_csv
+
+# 5. 点云投影到相机图像（可选）
+python3 tools/pc_projection.py /media/ipc/AQLoopCloseData2
+
+# 6. 拷贝关键帧数据（可选，需要修改脚本中的路径）
+bash tools/copy-keyframe.sh
+
+# 7. 拷贝 sweep 数据（可选）
+bash tools/copy-sweep.sh
 ```
 
 ### 旧版工具集
@@ -124,6 +136,15 @@ bash tools/export_localization_to_csv2.sh \
 # 5. 检查导出的 PCD/JPG 连续性
 python3 tools/check_pcd.py \
   /path/to/perception_data_20260129113410/raw_data
+
+# 6. 点云投影到相机图像（可选）
+python3 tools/pc_projection.py /media/ipc/AQLoopCloseData2
+
+# 7. 拷贝关键帧数据（可选，需要修改脚本中的路径）
+bash tools/copy-keyframe.sh
+
+# 8. 拷贝 sweep 数据（可选）
+bash tools/copy-sweep.sh
 ```
 
 ### 场景 2：相机标定数据处理
@@ -157,6 +178,24 @@ ros2 service call /localization_exporter/set_enable_save \
   std_srvs/srv/SetBool "{data: true}"
 ```
 
+### 场景 5：点云投影与数据整理
+
+```bash
+# 1. 点云投影到相机图像
+# 注意：需要先修改脚本中的 dt 和 all_gen 变量来配置时间补偿和生成帧数
+python3 tools/pc_projection.py /media/ipc/AQLoopCloseData2
+# 输出：在 ok_data/sequence*/ 目录下生成各相机的投影图像
+
+# 2. 拷贝关键帧数据（ok_data_2hz）
+# 注意：需要先修改脚本中的 INPUT_FIRST_DIR 和 OUTPUT_DIR
+bash tools/copy-keyframe.sh
+# 输出：将 ok_data_2hz 数据拷贝到指定输出目录
+
+# 3. 拷贝 sweep 数据（ok_data）
+bash tools/copy-sweep.sh
+# 输出：自动处理所有 first* 目录，将 ok_data 拷贝到 first*/sweep/ 目录
+```
+
 ---
 
 ## 📦 依赖要求
@@ -165,7 +204,10 @@ ros2 service call /localization_exporter/set_enable_save \
 
 ```bash
 # Python 基础依赖
-pip install numpy pyyaml pandas matplotlib numpy
+pip install numpy pyyaml pandas matplotlib opencv-python scipy pillow
+
+# 点云处理依赖（pc_projection.py 需要）
+pip install open3d python-pcl  # 或使用 open3d 的 Tensor API
 ```
 
 ### ROS2 依赖（部分工具需要）
@@ -188,6 +230,10 @@ source install/setup.bash
 - **Python**: 3.8+
 - **ROS2**: Humble 或兼容版本（部分工具需要）
 - **Bash**: 用于 `.sh` 脚本
+- **GNU parallel**: 用于并行处理（`copy-keyframe.sh`、`copy-sweep.sh` 需要）
+  - 安装：`sudo apt install parallel` 或 `brew install parallel`
+- **rsync**: 用于文件拷贝（`copy-keyframe.sh`、`copy-sweep.sh` 需要）
+  - 通常系统已预装
 
 ---
 
@@ -207,8 +253,17 @@ source install/setup.bash
 ### 我应该使用哪个工具？
 
 **处理 MCAP 格式数据** → 使用 `tools/` 目录下的工具
-- `extract_ros2_mcap_pcd_jpg.py` - 导出图像和点云
-- `export_localization_to_csv.py.sh` - 导出定位数据
+- `extract_ros2_mcap_pcd_jpg1.py` - 导出图像和点云
+- `export_localization_to_csv2.sh` - 导出定位数据
+- `2hzduiqi.py` - 点云和相机数据匹配与预处理
+
+**数据整理与拷贝** → 使用 `tools/` 目录下的工具
+- `copy-keyframe.sh` - 拷贝关键帧数据（ok_data_2hz）
+- `copy-sweep.sh` - 拷贝 sweep 数据（ok_data）
+
+**点云处理** → 使用 `tools/` 目录下的工具
+- `pc_projection.py` - 点云投影到相机图像
+- `check_pcd.py` - PCD/JPG 连续性检查
 
 **处理 db3 格式数据** → 使用 `old_tool/` 目录下的工具
 - `db3_to_yaml.py` - 转换 db3 bag 到 YAML
@@ -219,6 +274,15 @@ source install/setup.bash
 **相机标定处理** → 使用 `old_tool/` 目录下的工具
 - `convert_to_tencent_format.py` - 格式转换
 - `generate_extrinsics.py` - 外参矩阵生成
+
+**点云投影** → 使用 `tools/pc_projection.py`
+- 将点云投影到相机图像上
+- 支持时间补偿配置
+- 自动处理所有 sequence 目录和相机
+
+**数据整理** → 使用 `tools/` 目录下的拷贝工具
+- `copy-keyframe.sh` - 拷贝关键帧数据（ok_data_2hz），需要修改脚本中的路径
+- `copy-sweep.sh` - 拷贝 sweep 数据（ok_data），自动处理所有 first* 目录
 
 ---
 
@@ -257,6 +321,12 @@ source install/setup.bash
 ---
 
 ## 📝 更新日志
+
+### 2025-02-XX
+- ✅ 添加 `pc_projection.py` - 点云投影工具
+- ✅ 添加 `copy-keyframe.sh` - 关键帧数据拷贝工具
+- ✅ 添加 `copy-sweep.sh` - sweep 数据拷贝工具
+- ✅ 更新工具列表和工作流程
 
 ### 2025-02-02
 - ✅ 创建总 README 文档
