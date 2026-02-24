@@ -3,21 +3,26 @@ set -euo pipefail
 shopt -s nullglob
 
 ########################################
-# 路径解析
+# 用户配置：输入输出路径
 ########################################
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$(dirname "$(dirname "${SCRIPT_DIR}")")"
+# 输入 first 目录（包含 perception_data_*）
+INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/0212check"
 
-echo "脚本目录: ${SCRIPT_DIR}"
-echo "基础目录: ${BASE_DIR}"
+# 输出目录（生成 sweep/bev_data_*）
+OUTPUT_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/sweepcheck"
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "输入目录:  $INPUT_FIRST_DIR"
+echo "输出目录:  $OUTPUT_DIR"
 echo
 
 ########################################
-# 单个 perception 处理函数
+# 单个 ok_data 处理函数
 ########################################
 process_one() {
     ok_data_dir="$1"
-    first_dir="$2"
+    output_root="$2"
 
     perception_dir="$(dirname "$ok_data_dir")"
     perception_name="$(basename "$perception_dir")"
@@ -29,7 +34,7 @@ process_one() {
     index="${BASH_REMATCH[2]}"
     sequence_name=$(printf "sequence%05d" "$index")
 
-    target_dir="${first_dir}/sweep/bev_data_${timestamp}_${index}_${sequence_name}"
+    target_dir="${output_root}/bev_data_${timestamp}_${index}_${sequence_name}"
 
     if [ -e "$target_dir" ]; then
         echo "⚠️ 已存在，跳过: $target_dir"
@@ -49,10 +54,23 @@ process_one() {
         --info=progress2,stats1 \
         "${ok_data_dir}/" "${target_dir}/"
 
-    # CSV 单独拷贝
+    # --- 平铺唯一 sequence* 子目录 ---
+    seq_subdir=$(find "$target_dir" -maxdepth 1 -type d -name "sequence*" | head -n1)
+    if [ -n "$seq_subdir" ] && [ "$seq_subdir" != "$target_dir" ]; then
+        echo "    平铺 ${seq_subdir} -> ${target_dir}"
+        shopt -s dotglob
+        mv "$seq_subdir"/* "$target_dir"/
+        shopt -u dotglob
+        rmdir "$seq_subdir"
+    fi
+
+    # --- 拷贝 CSV 到 localization 文件夹 ---
     csv="${perception_dir}/localization_${index}.csv"
     if [ -f "$csv" ]; then
-        cp "$csv" "$target_dir/"
+        loc_dir="${target_dir}/localization"
+        mkdir -p "$loc_dir"
+        cp "$csv" "$loc_dir/"
+        echo "    拷贝 CSV -> ${loc_dir}/"
     fi
 
     echo "✅ 完成: $(basename "$target_dir")"
@@ -62,22 +80,10 @@ process_one() {
 export -f process_one
 
 ########################################
-# 主循环：first*
+# 主循环：处理所有 perception_data_* 的 ok_data
 ########################################
-for first_dir in "${BASE_DIR}"/first*; do
-    [ -d "$first_dir" ] || continue
+find "$INPUT_FIRST_DIR" -maxdepth 2 -path "*/perception_data_*/ok_data" -type d \
+| parallel --line-buffer -j 2 process_one {} "$OUTPUT_DIR"
 
-    first_name="$(basename "$first_dir")"
-    echo "=============================="
-    echo "处理 first 目录: $first_name"
-    echo "=============================="
+echo "🎉 所有 sweep 数据整理完成"
 
-    mkdir -p "${first_dir}/sweep"
-
-    # 查找所有 ok_data，并行 2 路（HDD 最优）
-    find "$first_dir" -maxdepth 2 -path "*/perception_data_*/ok_data" -type d \
-    | parallel --line-buffer -j 2 process_one {} "$first_dir"
-
-    echo "🎉 ${first_name} sweep 数据整理完成"
-    echo
-done

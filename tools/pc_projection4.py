@@ -11,6 +11,7 @@ import pdb
 import os
 import math
 import sys
+from pathlib import Path
 try:
   import open3d as o3d
   _O3D_AVAILABLE = True
@@ -31,37 +32,16 @@ CAM_OPTIONS = ["front_3mm", "rear_3mm", "front_left", "front_right", "rear_left"
 
 if(len(sys.argv) < 2):
     print("需要1个参数: dataset_root")
-    print("示例: python3 pc_projection.py <data_root>")
-    print("  - dataset_root: 数据根目录（包含 ok_data 目录）")
+    print("示例1（单组）: python3 pc_projection4.py <perception_data_xxx_dir>")
+    print("  - perception_data_xxx_dir: 数据目录（包含 ok_data 目录）")
+    print("示例2（批处理）: python3 pc_projection4.py <first_xxx_dir 或包含first_*的根目录>")
+    print("  - first_xxx_dir: 目录下包含 perception_data_* 子目录；标定统一从 first_xxx_dir/parameter 读取")
     print("\n注意: 时间补偿和生成帧数在脚本中配置（dt 和 all_gen 变量）")
     print("脚本会自动搜索所有 sequence 目录并为所有相机生成投影图像")
     exit(1)
 
 data_root = sys.argv[1]
 map_data_root = data_root  # map_data_root 等于 data_root
-
-# 检查数据目录
-if not os.path.exists(data_root):
-    print(f"错误: 数据目录不存在: {data_root}")
-    exit(1)
-
-# 检查 ok_data 目录
-ok_data_dir = os.path.join(data_root, 'ok_data')
-if not os.path.exists(ok_data_dir):
-    print(f"错误: 目录 {ok_data_dir} 不存在")
-    exit(1)
-
-# 自动列出所有存在的 sequence 目录
-sequence_dirs = [d for d in os.listdir(ok_data_dir) 
-                 if os.path.isdir(os.path.join(ok_data_dir, d)) and d.startswith('sequence')]
-sequence_dirs.sort()
-
-if len(sequence_dirs) == 0:
-    print(f"错误: 在 {ok_data_dir} 下没有找到 sequence 目录")
-    exit(1)
-
-print(f"找到 {len(sequence_dirs)} 个 sequence 目录: {sequence_dirs}")
-print(f"将处理 {len(CAM_OPTIONS)} 个相机: {CAM_OPTIONS}")
 
 dt1=int(abs(dt*1000))
 dt_str=""
@@ -212,11 +192,12 @@ def jet_colormap(intensity, min_val=0, max_val=150):
 
   return int(b), int(g), int(r)
 
-def show_with_opencv(image, coords=None, save=None, dir=None, camera_name=None):
+def show_with_opencv(image, coords=None, save=None, dir=None, camera_name=None, idx=0):
   """
   image: opencv image
   coords: 像素坐标系下的点, N*4
   camera_name: 相机名称，用于显示
+  idx: 帧索引，用于生成文件名
   """
   canvas = image.copy()
   if camera_name:
@@ -229,8 +210,8 @@ def show_with_opencv(image, coords=None, save=None, dir=None, camera_name=None):
                 color=(0, 0, 255))
   canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
   # 画点
-  range_p = np.clip(coords[:,-1] * 5, 0, 255).astype(np.int32)
-  if coords is not None:
+  if coords is not None and coords.shape[0] > 0:
+    range_p = np.clip(coords[:,-1] * 5, 0, 255).astype(np.int32)
     for index in range(coords.shape[0]):
       p = (int(coords[index, 0]), int(coords[index, 1]))          
       color = jet_colormap(coords[index, -1], min_val=1, max_val=255)
@@ -265,13 +246,13 @@ def get_calibration(sensor_kit_file, sensor_base_file, camera_intrinsic_file):
 
   return sensor_kit_data, sensor_base_data, camera_intrinsic_data
 
-def resolve_calibration_paths(data_root_path: str, camera_key: str):
+def resolve_calibration_paths(data_root_path: str, camera_key: str, calib_root: str = None):
   """
   解析标定文件路径，支持多种根目录：
   - 环境变量 CALIB_ROOT
-  - data_root/parameter
-  - dirname(data_root)/parameter
-  - 项目内参数目录：<repo>/parameter
+  - 显式传入 calib_root（批处理：first_xxx/parameter）
+  - data_root/parameter（单组：perception_data_xxx/parameter）
+  - 项目内参数目录：<repo>/parameter（兜底）
   找到第一个存在的根后，拼接子路径。
   """
   # 推断项目 parameter 路径
@@ -280,8 +261,9 @@ def resolve_calibration_paths(data_root_path: str, camera_key: str):
   candidates = []
   if os.environ.get('CALIB_ROOT'):
     candidates.append(os.environ.get('CALIB_ROOT'))
+  if calib_root:
+    candidates.append(calib_root)
   candidates.append(os.path.join(data_root_path, 'parameter'))
-  candidates.append(os.path.join(os.path.dirname(data_root_path), 'ok_date', 'parameter'))
   candidates.append(os.path.join(repo_root, 'parameter'))
 
   chosen = None
@@ -316,13 +298,13 @@ def distortionCorrection(k_matrix: np.array, d_matrix: np.array, frame):
   undistort_frame = undistort(k_matrix, d_matrix, frame)
   return undistort_frame
 
-def distort(camera_intrinsic_data, data_root, sequence_index, camera_name, idx, save=None):
+def distort(camera_intrinsic_data, data_root, sequence_index, camera_name, idx, ok_data_name='ok_data', save=None):
   K = np.array(camera_intrinsic_data['camera_matrix']['data']).reshape(
     camera_intrinsic_data['camera_matrix']['rows'], camera_intrinsic_data['camera_matrix']['cols'])
 
   D = np.array(camera_intrinsic_data['distortion_coefficients']['data']).reshape(14, 1).astype(np.float32)
 
-  img_dir = os.path.join(data_root, 'ok_data', sequence_index, camera_name)
+  img_dir = os.path.join(data_root, ok_data_name, sequence_index, camera_name)
   list_files = os.listdir(img_dir)
   list_files.sort()
   if len(list_files) == 0:
@@ -384,13 +366,21 @@ def get_M1andM2(sensor_kit_data, sensor_base_data, camera_intrinsic_data, camera
 
   return M1, M2                                            
 
-def process_sequence_camera(data_root, sequence_index, camera_name_for_calib, camera_name_for_output, map_data_root, dt_str, camera_name_map, idx):
+def process_sequence_camera(data_root, sequence_index, camera_name_for_calib, camera_name_for_output, map_data_root, dt_str, camera_name_map, idx, ok_data_name='ok_data', calib_root=None):
   """
   处理单个 sequence 和单个相机的投影
   camera_name_for_calib: 用于查找标定文件的相机名称（可能是映射后的，如 front）
   camera_name_for_output: 用于输出目录的相机名称（原始名称，如 front_3mm）
+  ok_data_name: ok_data 目录名称（如 'ok_data' 或 'ok_data_2hz'）
+  返回: True=成功, False=失败, "skipped"=已存在跳过
   """
-  lidar_dir = os.path.join(data_root, 'ok_data', sequence_index, 'lidar')
+  # 检查输出文件是否已存在
+  output_dir = os.path.join(map_data_root, f"projection{dt_str}", sequence_index, camera_name_for_output)
+  output_file = os.path.join(output_dir, f"map{idx:03d}.jpeg")
+  if os.path.exists(output_file):
+    return "skipped"
+  
+  lidar_dir = os.path.join(data_root, ok_data_name, sequence_index, 'lidar')
   if not os.path.exists(lidar_dir):
     print(f"⚠️ 警告：目录 {lidar_dir} 不存在，跳过")
     return False
@@ -407,76 +397,171 @@ def process_sequence_camera(data_root, sequence_index, camera_name_for_calib, ca
   lidar_file = os.path.join(lidar_dir, list_files[idx])
   points = read_pcd(lidar_file)
 
-  sensor_kit_file, sensor_base_file, camera_intrinsic_file = resolve_calibration_paths(data_root, camera_name_for_calib)
+  sensor_kit_file, sensor_base_file, camera_intrinsic_file = resolve_calibration_paths(data_root, camera_name_for_calib, calib_root=calib_root)
   if sensor_kit_file is None:
     print(f'[WARN] Skip projection due to missing calibration files for {camera_name_for_calib}.')
     return False
   
   sensor_kit_data, sensor_base_data, camera_intrinsic_data = get_calibration(sensor_kit_file, sensor_base_file, camera_intrinsic_file)
   # 读取图片时使用原始相机名称（camera_name_for_output）
-  img = distort(camera_intrinsic_data, data_root, sequence_index, camera_name_for_output, idx, save=False)
+  img = distort(camera_intrinsic_data, data_root, sequence_index, camera_name_for_output, idx, ok_data_name=ok_data_name, save=False)
 
   M1, M2 = get_M1andM2(sensor_kit_data, sensor_base_data, camera_intrinsic_data, camera_name_for_calib, camera_name_map)
   
   coords = project(points, img, M1, M2)
-  show_with_opencv(img, coords=coords, save=True, dir=str(os.path.join(map_data_root, f"projection{dt_str}", sequence_index, camera_name_for_output)), camera_name=camera_name_for_output)
+  show_with_opencv(img, coords=coords, save=True, dir=str(os.path.join(map_data_root, f"projection{dt_str}", sequence_index, camera_name_for_output)), camera_name=camera_name_for_output, idx=idx)
   return True
 
 
-if __name__ == '__main__':
-  # 遍历所有 sequence 和所有相机
+def process_perception_dir(perception_dir: str, calib_root: str = None):
+  """
+  处理单个 perception_data_* 目录：遍历 ok_data 目录下所有 sequence 与相机，生成 projection{dt_str}
+  calib_root: 优先使用该目录作为 parameter 根（批处理时为 first_xxx/parameter）
+  """
+  global dt_str
+  data_root = perception_dir
+  map_data_root = perception_dir
+
+  if not os.path.exists(data_root):
+    print(f"错误: 数据目录不存在: {data_root}")
+    return
+
+  # 只处理 ok_data 目录（不处理 ok_data_2hz 等）
+  ok_data_dir = os.path.join(data_root, 'ok_data')
+  if not os.path.exists(ok_data_dir):
+    print(f"⚠️ 跳过: 目录 {ok_data_dir} 不存在")
+    return
+
+  sequence_dirs = [d for d in os.listdir(ok_data_dir)
+                   if os.path.isdir(os.path.join(ok_data_dir, d)) and d.startswith('sequence')]
+  sequence_dirs.sort()
+  
+  if len(sequence_dirs) == 0:
+    print(f"⚠️ 跳过: 在 {ok_data_dir} 下没有找到 sequence 目录")
+    return
+
+  print(f"\n=== 处理数据: {data_root}")
+  print(f"找到 {len(sequence_dirs)} 个 sequence 目录: {sequence_dirs}")
+  print(f"将处理 {len(CAM_OPTIONS)} 个相机: {CAM_OPTIONS}")
+  if calib_root:
+    print(f"标定参数统一从: {calib_root}")
+
   total_processed = 0
   total_failed = 0
-  
+  total_skipped = 0
+
   for sequence_index in sequence_dirs:
     for camera_name in CAM_OPTIONS:
-      # 检查相机目录是否存在
-      camera_dir = os.path.join(ok_data_dir, sequence_index, camera_name)
+      camera_dir = os.path.join(data_root, 'ok_data', sequence_index, camera_name)
       if not os.path.exists(camera_dir):
         print(f"⚠️ 跳过: {sequence_index}/{camera_name} (目录不存在)")
         continue
-      
-      # 检查相机名称是否有效
+
       camera_name_actual = camera_name
       if camera_name in cam_alias:
         camera_name_actual = cam_alias[camera_name]
-      
+
       if camera_name_actual not in camera_name_map.keys():
         print(f"⚠️ 跳过: {sequence_index}/{camera_name} (不支持的相机名称)")
         continue
-      
-      print(f"正在处理: sequence={sequence_index}, camera={camera_name}")
-      
-      # 获取lidar文件数量以确定需要处理的帧数
+
+      print(f"正在处理: ok_data/{sequence_index}/{camera_name}")
+
+      # 检查 LiDAR 和相机文件数量，取较小值作为处理帧数
       lidar_dir = os.path.join(data_root, 'ok_data', sequence_index, 'lidar')
-      if os.path.exists(lidar_dir):
-        list_files = sorted([f for f in os.listdir(lidar_dir) if f.endswith('.pcd')])
-        if all_gen:
-          count = len(list_files)
-        else:
-          count = min(5, len(list_files))
-      else:
+      camera_dir = os.path.join(data_root, 'ok_data', sequence_index, camera_name)
+      
+      if not os.path.exists(lidar_dir):
         print(f"⚠️ 警告: {lidar_dir} 不存在，跳过")
         continue
       
-      if count == 0:
+      if not os.path.exists(camera_dir):
+        print(f"⚠️ 警告: {camera_dir} 不存在，跳过")
+        continue
+
+      lidar_files = sorted([f for f in os.listdir(lidar_dir) if f.endswith('.pcd')])
+      camera_files = sorted([f for f in os.listdir(camera_dir) if f.endswith('.jpg')])
+      
+      if len(lidar_files) == 0:
         print(f"⚠️ 警告: {lidar_dir} 下没有 .pcd 文件，跳过")
         continue
       
-      # 处理每一帧
+      if len(camera_files) == 0:
+        print(f"⚠️ 警告: {camera_dir} 下没有 .jpg 文件，跳过")
+        continue
+
+      # 使用 LiDAR 和相机文件数量的较小值，确保不会索引越界
+      if all_gen:
+        count = min(len(lidar_files), len(camera_files))
+      else:
+        count = min(5, len(lidar_files), len(camera_files))
+
+      if count == 0:
+        print(f"⚠️ 警告: 没有可处理的文件，跳过")
+        continue
+
       success_count = 0
+      skipped_count = 0
       for idx in range(count):
         try:
-          if process_sequence_camera(data_root, sequence_index, camera_name_actual, camera_name, map_data_root, dt_str, camera_name_map, idx):
+          result = process_sequence_camera(
+            data_root,
+            sequence_index,
+            camera_name_actual,
+            camera_name,
+            map_data_root,
+            dt_str,
+            camera_name_map,
+            idx,
+            ok_data_name='ok_data',
+            calib_root=calib_root,
+          )
+          if result == "skipped":
+            skipped_count += 1
+            total_skipped += 1
+          elif result:
             success_count += 1
             total_processed += 1
           else:
             total_failed += 1
         except Exception as e:
-          print(f"❌ 处理 {sequence_index}/{camera_name} 第 {idx} 帧时出错: {e}")
+          print(f"❌ 处理 ok_data/{sequence_index}/{camera_name} 第 {idx} 帧时出错: {e}")
           total_failed += 1
-      
-      print(f"✓ 完成: {sequence_index}/{camera_name} ({success_count}/{count} 帧成功)")
-  
-  print(f"\n所有处理完成！")
-  print(f"总计: {total_processed} 帧成功, {total_failed} 帧失败")
+
+      print(f"✓ 完成: ok_data/{sequence_index}/{camera_name} (成功:{success_count}, 跳过:{skipped_count}, 失败:{count-success_count-skipped_count}/{count} 帧)")
+
+  print(f"\n数据 {data_root} 处理完成！成功 {total_processed}，跳过 {total_skipped}，失败 {total_failed}")
+
+
+def find_first_dirs(root: Path) -> List[Path]:
+  if root.name.startswith("first_"):
+    return [root]
+  return sorted([p for p in root.glob("first_*") if p.is_dir()])
+
+
+if __name__ == '__main__':
+  # 支持两种模式：
+  # 1) 单组：传入 perception_data_* 目录（包含 ok_data）
+  # 2) 批处理：传入 first_* 目录 或 包含 first_* 的根目录
+  root = Path(sys.argv[1]).resolve()
+
+  # 单组模式（直接包含 ok_data）
+  if (root / "ok_data").is_dir():
+    process_perception_dir(str(root), calib_root=None)
+    sys.exit(0)
+
+  # 批处理：遍历 first_* / perception_data_*
+  first_dirs = find_first_dirs(root)
+  if not first_dirs:
+    print(f"错误: 未找到 first_* 目录，且 {root} 下无 ok_data")
+    sys.exit(1)
+
+  for first_dir in first_dirs:
+    calib_root = str(first_dir / "parameter")
+    # 只要目录存在就作为优先标定根
+    if not os.path.isdir(calib_root):
+      calib_root = None
+
+    print(f"\n########## 批处理 first 目录: {first_dir} ##########")
+    for p in sorted(first_dir.glob("perception_data_*")):
+      process_perception_dir(str(p), calib_root=calib_root)

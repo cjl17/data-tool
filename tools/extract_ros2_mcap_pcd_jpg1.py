@@ -582,7 +582,7 @@ def _find_perception_data_dirs(search_dir: Path) -> list[Path]:
     """Find all perception_data_* directories in the search directory."""
     perception_dirs = []
     for item in search_dir.iterdir():
-        if item.is_dir() and item.name.startswith("perception_data_") and (item / "metadata.yaml").exists():
+       if item.is_dir() and item.name.startswith("perception_data_"):
             perception_dirs.append(item)
     return sorted(perception_dirs)
 

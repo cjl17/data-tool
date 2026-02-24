@@ -6,8 +6,8 @@ shopt -s nullglob
 # 【用户只需要改这里】
 ########################################
 
-INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341"
-OUTPUT_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/pix-20260110-a"
+INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/0212check"
+OUTPUT_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/pix-20260112checks-a"
 
 ########################################
 # 安全检查
@@ -57,14 +57,29 @@ process_one_2hz() {
 
     echo "➡️  [2Hz] $(basename "$perception_dir")"
 
-    # 只拷贝 ok_data_2hz 内容
-    rsync -rL \
-        --whole-file \
-        --inplace \
-        --no-perms --no-owner --no-group \
-        --omit-dir-times \
-        --info=progress2,stats1 \
-        "${ok_data_2hz_dir}/" "${target_dir}/"
+    # 找到 ok_data_2hz 下唯一 sequence* 目录
+    seq_subdir=("$ok_data_2hz_dir"/sequence*/)
+    seq_subdir="${seq_subdir%/}"   # 去掉末尾斜杠
+
+    if [ -d "$seq_subdir" ]; then
+        # 拷贝 sequence 下的内容到 bev_data 目录，不保留 sequence 层
+        rsync -rL \
+            --whole-file \
+            --inplace \
+            --no-perms --no-owner --no-group \
+            --omit-dir-times \
+            --info=progress2,stats1 \
+            "${seq_subdir}/" "${target_dir}/"
+    else
+        # 万一没有 sequence 目录，直接拷贝 ok_data_2hz 内容
+        rsync -rL \
+            --whole-file \
+            --inplace \
+            --no-perms --no-owner --no-group \
+            --omit-dir-times \
+            --info=progress2,stats1 \
+            "${ok_data_2hz_dir}/" "${target_dir}/"
+    fi
 
     echo "✅ 完成: $(basename "$target_dir")"
     echo
@@ -82,3 +97,4 @@ find "$INPUT_FIRST_DIR" \
 | parallel --line-buffer -j 2 process_one_2hz {} "$OUTPUT_DIR"
 
 echo "🎉 所有 ok_data_2hz 拷贝完成"
+

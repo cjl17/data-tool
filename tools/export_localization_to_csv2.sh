@@ -22,7 +22,7 @@ import glob
 import re
 
 
-DEFAULT_MCAP_DIR = "/media/ipc/AQLoopCloseData2/perception_data_20260205125341"  # 默认扫描目录
+DEFAULT_MCAP_DIR = "/media/ipc/AQLoopCloseData/perception_data_20260207094324"  # 默认扫描目录
 
 
 # ----------------- 辅助函数 -----------------
@@ -62,11 +62,11 @@ def find_first_dir_and_perception_dir(mcap_file_path):
     if not timestamp:
         return (None, None, None)
     
-    # 找到AQLoopCloseData2目录
+    # 找到AQLoopCloseData——n目录
     aq_dir = None
     path_parts = mcap_file_path.split(os.sep)
-    if 'AQLoopCloseData2' in path_parts:
-        idx = path_parts.index('AQLoopCloseData2')
+    if 'AQLoopCloseData' in path_parts:
+        idx = path_parts.index('AQLoopCloseData')
         aq_dir = os.sep.join(path_parts[:idx+1])
     
     if not aq_dir or not os.path.exists(aq_dir):

@@ -4,6 +4,7 @@
 """
 AQLoop batch raw_data 对齐 + sequence 导出 + 2Hz 抽帧
 自动查找 first_* / perception_data_*
+修复版：处理所有first_*目录
 """
 
 import os
@@ -40,13 +41,41 @@ class AQLoopPreprocessor:
         self.logger = logging.getLogger("AQLoopPreprocessor")
 
     def extract_timestamp(self, path: str) -> float:
+        """从文件名提取时间戳（毫秒或纳秒），转换为秒"""
         name = os.path.basename(path)
+        # 先尝试匹配带小数点的格式（如 123.456）
         m = re.findall(r"\d+\.\d+", name)
-        return float(m[-1]) if m else 0.0
+        if m:
+            return float(m[-1])
+        
+        # 如果没有小数点，提取所有数字（可能是毫秒或纳秒时间戳）
+        # 文件名格式通常是：时间戳.扩展名，如 1770689760099.pcd
+        m = re.findall(r"(\d+)", name)
+        if m:
+            ts_int = int(m[0])  # 取第一个数字串
+            # 判断是毫秒还是纳秒：
+            # - 13位数字通常是毫秒时间戳（如 1770689760099）
+            # - 19位数字通常是纳秒时间戳
+            ts_str = str(ts_int)
+            if len(ts_str) >= 19:
+                return ts_int / 1e9  # 纳秒转秒
+            elif len(ts_str) >= 13:
+                return ts_int / 1e3  # 毫秒转秒
+            else:
+                # 小于13位，可能是秒级时间戳，直接返回
+                return float(ts_int)
+        
+        return 0.0
 
-    def is_2hz(self, ts: float, tol=0.01) -> bool:
-        frac = ts % 1.0
-        return abs(frac - 0.0) < tol or abs(frac - 0.5) < tol
+    def is_2hz(self, ts: float, base_ts: float, tol=0.01) -> bool:
+        """
+        判断时间戳是否在 2Hz 位置（每 0.5 秒一帧）
+        基于相对时间戳（相对于第一个时间戳）
+        """
+        relative_ts = ts - base_ts
+        # 2Hz = 每 0.5 秒一帧，判断相对时间是否是 0.5 的倍数（允许小误差）
+        remainder = relative_ts % 0.5
+        return remainder < tol or (0.5 - remainder) < tol
 
     def load_files(self):
         pcd_root = self.base_path / "pcd"
@@ -113,6 +142,9 @@ class AQLoopPreprocessor:
             "rear_left", "rear_right",
         ]
 
+        # 计算基准时间戳（第一个匹配帧的时间戳）
+        base_ts = self.extract_timestamp(matched[0][0]) if matched else 0.0
+
         for i, g in enumerate(matched):
             seq = out / "sequence00000"
             seq2 = out2 / "sequence00000"
@@ -131,12 +163,12 @@ class AQLoopPreprocessor:
             for name, cam in zip(cam_names, g[1:]):
                 src = Path(cam)
                 link(src, seq / name / src.name)
-                if self.is_2hz(ts):
+                if self.is_2hz(ts, base_ts):
                     link(src, seq2 / name / src.name)
 
             lidar = Path(g[0])
             link(lidar, seq / "lidar" / lidar.name)
-            if self.is_2hz(ts):
+            if self.is_2hz(ts, base_ts):
                 link(lidar, seq2 / "lidar" / lidar.name)
 
     def run(self, out_root: Path):
@@ -163,17 +195,22 @@ def main():
     if not first_dirs:
         raise RuntimeError("未找到 first_* 目录")
 
-    first = first_dirs[0]
-    logging.info(f"使用 first 目录: {first.name}")
+    # ============ 修复：遍历所有first_*目录，而不是只取第一个 ============
+    for first_dir in first_dirs:
+        logging.info(f"处理 first 目录: {first_dir.name}")
+        
+        for p in sorted(first_dir.glob("perception_data_*")):
+            raw = p / "raw_data"
+            if not raw.exists():
+                continue
 
-    for p in sorted(first.glob("perception_data_*")):
-        raw = p / "raw_data"
-        if not raw.exists():
-            continue
-
-        logging.info(f"处理: {p.name}")
-        proc = AQLoopPreprocessor(raw)
-        proc.run(p)
+            logging.info(f"  处理 perception_data: {p.name}")
+            try:
+                proc = AQLoopPreprocessor(raw)
+                proc.run(p)
+                logging.info(f"  完成: {p.name}")
+            except Exception as e:
+                logging.error(f"  处理失败 {p.name}: {e}")
 
 
 if __name__ == "__main__":
