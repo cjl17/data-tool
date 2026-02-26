@@ -6,8 +6,8 @@ shopt -s nullglob
 # 【用户只需要改这里】
 ########################################
 
-INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/0212check"
-OUTPUT_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/pix-20260112checks-a"
+INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData/first_20260210100908"
+OUTPUT_DIR="/media/ipc/AQLoopCloseData/first_20260210100908/pix-20260112-a"
 
 ########################################
 # 安全检查

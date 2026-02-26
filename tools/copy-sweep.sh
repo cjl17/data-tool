@@ -6,10 +6,10 @@ shopt -s nullglob
 # 用户配置：输入输出路径
 ########################################
 # 输入 first 目录（包含 perception_data_*）
-INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/0212check"
+INPUT_FIRST_DIR="/media/ipc/AQLoopCloseData/first_20260210100908"
 
 # 输出目录（生成 sweep/bev_data_*）
-OUTPUT_DIR="/media/ipc/AQLoopCloseData2/first_20260205125341/sweepcheck"
+OUTPUT_DIR="/media/ipc/AQLoopCloseData/first_20260210100908/sweep"
 
 mkdir -p "$OUTPUT_DIR"
 

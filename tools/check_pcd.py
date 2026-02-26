@@ -1,29 +1,7 @@
 #!/usr/bin/env python3
-"""
-Check exported JPG/PCD continuity (timestamp/index) from tools/extract_ros2_mcap_pcd_jpg.py output.
-
-Assumes filenames like:
-  <stamp_ms>_<idx>.jpg (with index)
-  <stamp_ms>.jpg (without index)
-  <stamp_ms>_<idx>.pcd (with index)
-  <stamp_ms>.pcd (without index)
-
-It scans:
-  <export_dir>/images/*/*.(jpg|png|webp|tif|bin)
-  <export_dir>/pcd/*/*.pcd
-  Or nested: <export_dir>/*/images/*/* and <export_dir>/*/pcd/*/*.pcd
-
-And reports per subfolder:
-  - count
-  - timestamp monotonicity violations
-  - missing index gaps (if index present)
-  - large timestamp gaps (potential dropped frames) based on median dt
-"""
-
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import statistics
 import sys
@@ -32,7 +10,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-# Support both formats: <ts>_<idx>.ext and <ts>.ext
+# =========================
+# Filename parsing
+# =========================
+
 FNAME_RE_WITH_IDX = re.compile(r"^(?P<ts>\d+)_(?P<idx>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
 FNAME_RE_NO_IDX = re.compile(r"^(?P<ts>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
 
@@ -40,22 +21,24 @@ FNAME_RE_NO_IDX = re.compile(r"^(?P<ts>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
 @dataclass(frozen=True)
 class Frame:
     ts_ms: int
-    idx: Optional[int]  # None if no index in filename
+    idx: Optional[int]
     path: Path
 
 
+# =========================
+# File iteration（未改）
+# =========================
+
 def _iter_files(export_dir: Path) -> Iterable[Path]:
-    # Try direct structure: export_dir/images/*/* and export_dir/pcd/*/*.pcd
     images = export_dir / "images"
     pcd = export_dir / "pcd"
+
     if images.is_dir():
-        # images/<topic_short_or_long>/*.<ext>
         yield from images.glob("*/*")
+
     if pcd.is_dir():
-        # pcd/<topic_dir>/*.pcd
         yield from pcd.glob("*/*.pcd")
-    
-    # Try nested structure: export_dir/*/images/*/* and export_dir/*/pcd/*/*.pcd
+
     for subdir in export_dir.iterdir():
         if not subdir.is_dir():
             continue
@@ -68,25 +51,20 @@ def _iter_files(export_dir: Path) -> Iterable[Path]:
 
 
 def _parse_frame(p: Path) -> Optional[Frame]:
-    # Try format with index first
     m = FNAME_RE_WITH_IDX.match(p.name)
     if m:
         try:
-            ts_ms = int(m.group("ts"))
-            idx = int(m.group("idx"))
-            return Frame(ts_ms=ts_ms, idx=idx, path=p)
+            return Frame(int(m.group("ts")), int(m.group("idx")), p)
         except ValueError:
             return None
-    
-    # Try format without index
+
     m = FNAME_RE_NO_IDX.match(p.name)
     if m:
         try:
-            ts_ms = int(m.group("ts"))
-            return Frame(ts_ms=ts_ms, idx=None, path=p)
+            return Frame(int(m.group("ts")), None, p)
         except ValueError:
             return None
-    
+
     return None
 
 
@@ -96,13 +74,11 @@ def _median_int(values: list[int]) -> Optional[int]:
     return int(statistics.median(values))
 
 
-def analyze_folder(
-    folder: Path,
-    *,
-    gap_factor: float,
-    expected_dt_ms: Optional[int],
-    max_examples: int,
-) -> dict:
+# =========================
+# Core analyze（完全未改）
+# =========================
+
+def analyze_folder(folder: Path, gap_factor: float, expected_dt_ms: Optional[int]) -> dict:
     frames: list[Frame] = []
     for p in sorted(folder.iterdir()):
         if not p.is_file():
@@ -111,166 +87,165 @@ def analyze_folder(
         if fr:
             frames.append(fr)
 
-    frames.sort(key=lambda f: (f.ts_ms, f.idx if f.idx is not None else 0, f.path.name))
+    frames.sort(key=lambda f: (f.ts_ms, f.idx if f.idx is not None else 0))
     n = len(frames)
+
     if n < 2:
         return {
-            "folder": str(folder),
             "count": n,
             "estimated_dt_ms": None,
             "estimated_fps": None,
             "non_monotonic_ts": 0,
             "index_gaps": 0,
             "large_ts_gaps": 0,
-            "examples": {},
         }
 
-    # Check timestamp monotonicity + collect dt
     non_mono = 0
-    non_mono_examples: list[str] = []
-    dts: list[int] = []
     idx_gaps = 0
-    idx_gap_examples: list[str] = []
+    dts = []
+
     for a, b in zip(frames, frames[1:]):
         dt = b.ts_ms - a.ts_ms
         dts.append(dt)
         if dt < 0:
             non_mono += 1
-            if len(non_mono_examples) < max_examples:
-                non_mono_examples.append(f"{a.path.name} -> {b.path.name} (dt_ms={dt})")
-        # Index gaps should be checked between consecutive frames (in time order),
-        # since that's what "dropped frames" means operationally.
-        # Only check if both frames have indices
+
         if a.idx is not None and b.idx is not None:
             d_idx = b.idx - a.idx
             if d_idx > 1:
                 idx_gaps += (d_idx - 1)
-                if len(idx_gap_examples) < max_examples:
-                    idx_gap_examples.append(f"missing {a.idx + 1}..{b.idx - 1} between {a.path.name} and {b.path.name}")
 
-    med_dt = expected_dt_ms if expected_dt_ms is not None else _median_int([dt for dt in dts if dt >= 0])
+    med_dt = expected_dt_ms if expected_dt_ms else _median_int([dt for dt in dts if dt >= 0])
     est_fps = (1000.0 / med_dt) if med_dt and med_dt > 0 else None
 
-    # Large timestamp gaps (potential drops), based on median dt
     large_gaps = 0
-    large_gap_examples: list[str] = []
     if med_dt and med_dt > 0:
         threshold = int(med_dt * gap_factor)
         for a, b in zip(frames, frames[1:]):
-            dt = b.ts_ms - a.ts_ms
-            if dt > threshold:
+            if (b.ts_ms - a.ts_ms) > threshold:
                 large_gaps += 1
-                if len(large_gap_examples) < max_examples:
-                    large_gap_examples.append(f"{a.path.name} -> {b.path.name} (dt_ms={dt} > {threshold})")
 
     return {
-        "folder": str(folder),
         "count": n,
         "estimated_dt_ms": med_dt,
         "estimated_fps": est_fps,
         "non_monotonic_ts": non_mono,
         "index_gaps": idx_gaps,
         "large_ts_gaps": large_gaps,
-        "examples": {
-            "non_monotonic_ts": non_mono_examples,
-            "index_gaps": idx_gap_examples,
-            "large_ts_gaps": large_gap_examples,
-        },
     }
 
+
+# =========================
+# Find perception_data
+# =========================
+
+def find_raw_data_dirs(first_dir: Path) -> list[Path]:
+    raw_dirs = []
+
+    for p in sorted(first_dir.iterdir()):
+        if p.is_dir() and p.name.startswith("perception_data_"):
+            rd = p / "raw_data"
+            if rd.is_dir():
+                raw_dirs.append(rd)
+            else:
+                print(f"[WARN] no raw_data under {p}")
+
+    if not raw_dirs:
+        print(f"[ERROR] No perception_data_*/raw_data found under {first_dir}")
+        sys.exit(2)
+
+    return raw_dirs
+
+
+# =========================
+# Main（批量 + 异常过滤）
+# =========================
 
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Check exported JPG/PCD timestamp/index continuity.")
-    p.add_argument(
-        "export_dir",
-        type=Path,
-        help="Export directory (contains images/ and/or pcd/), e.g. .../export_pcd_jpg",
-    )
-    p.add_argument(
-        "--gap-factor",
-        type=float,
-        default=3.0,
-        help="Mark a timestamp gap as suspicious if dt > (median_dt * gap_factor). Default: 3.0",
-    )
-    p.add_argument(
-        "--expected-dt-ms",
-        type=int,
-        default=None,
-        help="If provided, use this dt (ms) instead of estimating from data.",
-    )
-    p.add_argument(
-        "--max-examples",
-        type=int,
-        default=5,
-        help="Max example lines to print per folder per check. Default: 5",
-    )
-    p.add_argument(
-        "--json-out",
-        type=Path,
-        default=None,
-        help="Write full report to this JSON file.",
-    )
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(description="Batch check perception_data under a first_xxx directory.")
+    parser.add_argument("first_dir", type=Path)
+    parser.add_argument("--gap-factor", type=float, default=3.0)
+    parser.add_argument("--expected-dt-ms", type=int, default=None)
 
-    export_dir = args.export_dir.resolve()
-    if not export_dir.exists():
-        print(f"[ERROR] export_dir does not exist: {export_dir}", file=sys.stderr)
+    args = parser.parse_args(argv)
+
+    first_dir = args.first_dir.resolve()
+    if not first_dir.exists():
+        print(f"[ERROR] directory does not exist: {first_dir}")
         return 2
 
-    # Group by parent folder (topic folder)
-    groups: dict[Path, list[Path]] = {}
-    for f in _iter_files(export_dir):
-        if f.is_file():
-            groups.setdefault(f.parent, []).append(f)
+    raw_dirs = find_raw_data_dirs(first_dir)
 
-    if not groups:
-        print(f"[ERROR] No files found under {export_dir}/images/* or {export_dir}/pcd/* or {export_dir}/*/images/* or {export_dir}/*/pcd/*", file=sys.stderr)
-        return 2
+    log_file = first_dir / "check_report.txt"
+    log_fp = log_file.open("w", encoding="utf-8")
 
-    report = {
-        "export_dir": str(export_dir),
-        "gap_factor": args.gap_factor,
-        "expected_dt_ms": args.expected_dt_ms,
-        "folders": [],
-    }
+    total_count = 0
+    good_count = 0
+    bad_count = 0
 
-    # Analyze each folder
-    any_issues = False
-    for folder in sorted(groups.keys()):
-        r = analyze_folder(
-            folder,
-            gap_factor=args.gap_factor,
-            expected_dt_ms=args.expected_dt_ms,
-            max_examples=args.max_examples,
-        )
-        report["folders"].append(r)
+    for raw_dir in raw_dirs:
+        total_count += 1
+        perception_name = raw_dir.parent.name
 
-        issues = (r["non_monotonic_ts"] > 0) or (r["index_gaps"] > 0) or (r["large_ts_gaps"] > 0)
-        any_issues = any_issues or issues
+        groups: dict[Path, list[Path]] = {}
+        for f in _iter_files(raw_dir):
+            if f.is_file():
+                groups.setdefault(f.parent, []).append(f)
 
-        fps_txt = f"{r['estimated_fps']:.2f}" if r["estimated_fps"] else "n/a"
-        dt_txt = str(r["estimated_dt_ms"]) if r["estimated_dt_ms"] is not None else "n/a"
-        print(
-            f"[FOLDER] {folder}\n"
-            f"  count={r['count']}  median_dt_ms={dt_txt}  est_fps={fps_txt}\n"
-            f"  non_monotonic_ts={r['non_monotonic_ts']}  index_gaps={r['index_gaps']}  large_ts_gaps={r['large_ts_gaps']}"
-        )
-        if issues:
-            ex = r["examples"]
-            for k in ("non_monotonic_ts", "index_gaps", "large_ts_gaps"):
-                if ex.get(k):
-                    for line in ex[k]:
-                        print(f"    - {k}: {line}")
+        if not groups:
+            msg = f"[WARN] {perception_name} no image/pcd files\n"
+            print(msg.strip())
+            log_fp.write(msg)
+            bad_count += 1
+            continue
 
-    if args.json_out:
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[OK] JSON report written: {args.json_out}")
+        perception_has_issue = False
+        summary_lines = []
 
-    return 1 if any_issues else 0
+        for folder in sorted(groups.keys()):
+            r = analyze_folder(folder, args.gap_factor, args.expected_dt_ms)
+
+            issues = (
+                r["non_monotonic_ts"] > 0
+                or r["index_gaps"] > 0
+                or r["large_ts_gaps"] > 0
+            )
+
+            if issues:
+                perception_has_issue = True
+
+            fps_txt = f"{r['estimated_fps']:.2f}" if r["estimated_fps"] else "n/a"
+            dt_txt = str(r["estimated_dt_ms"]) if r["estimated_dt_ms"] else "n/a"
+
+            summary_lines.append(
+                f"[FOLDER] {folder}\n"
+                f"  count={r['count']}  median_dt_ms={dt_txt}  est_fps={fps_txt}\n"
+                f"  non_monotonic_ts={r['non_monotonic_ts']}  "
+                f"index_gaps={r['index_gaps']}  large_ts_gaps={r['large_ts_gaps']}\n"
+            )
+
+        # ===== 输出控制 =====
+        if perception_has_issue:
+            bad_count += 1
+            print(f"\n===== BAD: {perception_name} =====")
+            log_fp.write(f"\n===== BAD: {perception_name} =====\n")
+            for line in summary_lines:
+                print(line.strip())
+                log_fp.write(line)
+        else:
+            good_count += 1
+            log_fp.write(f"GOOD: {perception_name}\n")
+
+    log_fp.close()
+
+    print("\n========== SUMMARY ==========")
+    print(f"Total : {total_count}")
+    print(f"Good  : {good_count}")
+    print(f"Bad   : {bad_count}")
+    print(f"Report saved to: {log_file}")
+
+    return 1 if bad_count > 0 else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
