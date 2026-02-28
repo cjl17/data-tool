@@ -22,7 +22,7 @@ import glob
 import re
 
 
-DEFAULT_MCAP_DIR = "/media/ipc/AQLoopCloseData/perception_data_20260207094324"  # 默认扫描目录
+DEFAULT_MCAP_DIR = "/media/ipc/AQLoopCloseData/perception_data_20260210132846"  # 默认扫描目录
 
 
 # ----------------- 辅助函数 -----------------

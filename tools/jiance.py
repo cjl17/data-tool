@@ -4,86 +4,187 @@
 import os
 import csv
 from pathlib import Path
+from collections import defaultdict
 from ultralytics import YOLO
 from tqdm import tqdm
+import torch
 
-# ----------------- 配置 -----------------
-ROOT_DIR = "/media/ipc/AQLoopCloseData/first_20260210100908"
-OUTPUT_CSV = os.path.join(ROOT_DIR, "perception_low_quality_report.csv")
-THRESHOLD_OBJECTS = 3  # 低物体帧判定阈值
-TARGET_CLASSES = ["car", "truck", "bus", "person", "tree", "building", "traffic light", "fence", "stop sign"]  # YOLO默认类别对应名称
-DEVICE = "cuda"  # 或 "cpu"
-# ----------------------------------------
 
-model = YOLO("yolov8n.pt")  # 默认模型
 
-def scan_images(folder_path):
-    """递归扫描文件夹下所有摄像头图片"""
-    image_paths = []
-    folder_path = Path(folder_path)
-    for cam_dir in folder_path.iterdir():
-        if cam_dir.is_dir():
-            for img_file in cam_dir.glob("*.jpg"):
-                # 记录相对摄像头路径
-                rel_path = str(Path(cam_dir.name) / img_file.name)
-                image_paths.append((img_file, rel_path))
-    return image_paths
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
-def process_perception_data(perception_path):
-    """处理单个 perception_data 文件夹"""
-    total_frames = 0
-    low_object_frames = 0
-    low_frame_images = []
+# ================= 配置 =================
+ROOT_DIR = "/media/pix/AQLoopCloseData"
+OUTPUT_CSV = os.path.join(ROOT_DIR, "class_ratio_report.csv")
+MODEL_PATH = "yolov8s.pt"
+DEVICE = "cuda"
+BATCH_SIZE = 120
 
-    image_list = scan_images(Path(perception_path) / "raw_data/images")
-    total_frames = len(image_list)
+# 只统计这些类别
+TARGET_CLASSES = [
+    "car",
+    "truck",
+    "bus",
+    "person",
+    "bicycle",
+    "motorcycle"
+]
+# =======================================
 
-    batch_size = 32  # 可调，GPU更大可增大
-    for i in tqdm(range(0, total_frames, batch_size), desc=f"Processing {Path(perception_path).name}"):
-        batch = image_list[i:i+batch_size]
-        img_paths = [p[0] for p in batch]
-        rel_paths = [p[1] for p in batch]
+# 加载模型
+model = YOLO(MODEL_PATH)
+CLASS_NAMES = model.names  # {0:'person',1:'bicycle',...}
 
-        results = model.predict(source=img_paths, device=DEVICE, classes=None, verbose=False, stream=False)
-        
-        for res, rel_path in zip(results, rel_paths):
-            # 统计目标类别数量
-            count = 0
-            if hasattr(res, 'boxes') and res.boxes is not None:
-                for box in res.boxes:
-                    cls_idx = int(box.cls[0].item()) if hasattr(box.cls[0], 'item') else int(box.cls[0])
-                    cls_name = model.names.get(cls_idx, "")
-                    if cls_name in TARGET_CLASSES:
-                        count += 1
-            if count < THRESHOLD_OBJECTS:
-                low_object_frames += 1
-                low_frame_images.append(rel_path)
+# 生成 name -> id 映射
+NAME_TO_ID = {v: k for k, v in CLASS_NAMES.items()}
 
-    low_ratio = round(low_object_frames / total_frames, 2) if total_frames > 0 else 0.0
-    return {
-        "folder": Path(perception_path).name,
-        "total_frames": total_frames,
-        "low_object_frames": low_object_frames,
-        "low_ratio": low_ratio,
-        "low_frame_images": ";".join(low_frame_images)
-    }
+# 目标类别ID集合（用于快速过滤）
+TARGET_CLASS_IDS = {NAME_TO_ID[name] for name in TARGET_CLASSES if name in NAME_TO_ID}
+
+
+def get_time_aligned_images(images_root):
+    """
+    返回按时间对齐的图片列表
+    [
+        [t0_cam1, t0_cam2, ...],
+        [t1_cam1, t1_cam2, ...],
+        ...
+    ]
+    """
+    cam_dirs = [d for d in Path(images_root).iterdir() if d.is_dir()]
+    if not cam_dirs:
+        return []
+
+    cam_dirs.sort()
+
+    cam_images = []
+    for cam in cam_dirs:
+        imgs = sorted(cam.glob("*.jpg"))
+        if len(imgs) == 0:
+            return []
+        cam_images.append(imgs)
+
+    min_len = min(len(x) for x in cam_images)
+
+    aligned = []
+    for i in range(min_len):
+        frame_imgs = [cam_images[c][i] for c in range(len(cam_images))]
+        aligned.append(frame_imgs)
+
+    return aligned
+
+
+def process_perception(perception_path):
+    images_root = Path(perception_path) / "raw_data/images"
+    if not images_root.exists():
+        return None
+
+    aligned_frames = get_time_aligned_images(images_root)
+    if not aligned_frames:
+        return None
+
+    total_frames = len(aligned_frames)
+
+    # 每类出现帧计数（只统计目标类）
+    class_frame_count = {name: 0 for name in TARGET_CLASSES}
+
+    # 展平图片
+    all_images = []
+    frame_index_map = []
+
+    for frame_idx, imgs in enumerate(aligned_frames):
+        for img in imgs:
+            all_images.append(img)
+            frame_index_map.append(frame_idx)
+
+    # 每帧检测到的类别（避免重复计数）
+    frame_detected_classes = [set() for _ in range(total_frames)]
+
+    # ================= 批量推理 =================
+    for i in tqdm(range(0, len(all_images), BATCH_SIZE),
+                  desc=f"{Path(perception_path).name}",
+                  leave=False):
+
+        batch_imgs = all_images[i:i+BATCH_SIZE]
+        batch_frames = frame_index_map[i:i+BATCH_SIZE]
+
+        results = model.predict(
+            source=batch_imgs,
+            device=DEVICE,
+            verbose=False,
+            stream=False
+        )
+
+        for res, frame_idx in zip(results, batch_frames):
+            if res.boxes is None:
+                continue
+
+            classes = res.boxes.cls.tolist()
+
+            for cls_id in classes:
+                cls_id = int(cls_id)
+
+                # 只保留目标类别
+                if cls_id in TARGET_CLASS_IDS:
+                    frame_detected_classes[frame_idx].add(cls_id)
+
+    # ================= 统计帧占比 =================
+    for frame_classes in frame_detected_classes:
+        for cls_id in frame_classes:
+            class_name = CLASS_NAMES[cls_id]
+            class_frame_count[class_name] += 1
+
+    # 转为比例
+    class_ratios = {}
+    for name in TARGET_CLASSES:
+        class_ratios[name] = round(class_frame_count[name] / total_frames, 3)
+
+    return total_frames, class_ratios
+
 
 def main():
-    perception_folders = [d for d in Path(ROOT_DIR).iterdir() if d.is_dir() and "perception_data" in d.name]
-    report_data = []
+    rows = []
 
-    for folder in perception_folders:
-        data = process_perception_data(folder)
-        report_data.append(data)
+    first_dirs = [d for d in Path(ROOT_DIR).iterdir()
+                  if d.is_dir() and d.name.startswith("first")]
 
-    # 写 CSV
+    for first in first_dirs:
+        perception_dirs = [d for d in first.iterdir()
+                           if d.is_dir() and "perception_data" in d.name]
+
+        for perception in perception_dirs:
+            print(f"Processing {perception}")
+
+            result = process_perception(perception)
+            if result is None:
+                continue
+
+            total_frames, ratios = result
+
+            row = {
+                "first_folder": first.name,
+                "perception_folder": perception.name,
+                "total_frames": total_frames
+            }
+            row.update(ratios)
+            rows.append(row)
+
+    # ================= 写CSV =================
+    fieldnames = [
+        "first_folder",
+        "perception_folder",
+        "total_frames"
+    ] + TARGET_CLASSES
+
     with open(OUTPUT_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["folder", "total_frames", "low_object_frames", "low_ratio", "low_frame_images"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in report_data:
-            writer.writerow(row)
+        for r in rows:
+            writer.writerow(r)
 
-    print(f"报告生成完成：{OUTPUT_CSV}")
+    print(f"\n完成！输出文件: {OUTPUT_CSV}")
+
 
 if __name__ == "__main__":
     main()

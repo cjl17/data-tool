@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
-import os
 import re
 import sys
 import tempfile
@@ -153,12 +152,13 @@ def _write_rosbag2_metadata_yaml_from_single_mcap(
             # If reading source metadata fails, fall back to MCAP summary
             topics_with_count = []
 
+    # Read MCAP summary once (used for both topics and timing)
+    with mcap_path.open("rb") as f:
+        r = make_reader(f)
+        summary = r.get_summary()
+
     # If we don't have topics from source metadata, read from MCAP summary
     if not topics_with_count:
-        with mcap_path.open("rb") as f:
-            r = make_reader(f)
-            summary = r.get_summary()
-
         channels = getattr(summary, "channels", {}) or {}
         schemas = getattr(summary, "schemas", {}) or {}
 
@@ -183,11 +183,6 @@ def _write_rosbag2_metadata_yaml_from_single_mcap(
                     "message_count": 0,
                 }
             )
-
-    # Read timing and message count from MCAP summary
-    with mcap_path.open("rb") as f:
-        r = make_reader(f)
-        summary = r.get_summary()
 
     # mcap summary fields (best-effort; set safe defaults when absent)
     msg_count = int(getattr(getattr(summary, "statistics", None), "message_count", 0) or 0)
@@ -578,11 +573,39 @@ def _get_first_dir_name(perception_dir: Path) -> str:
     return f"first_{perception_dir.name}"
 
 
+def _is_perception_data_dir(path: Path) -> bool:
+    """Check if a path is a perception_data_* directory (excluding _csv suffix)."""
+    return path.name.startswith("perception_data_") and not path.name.endswith("_csv")
+
+
+def _get_base_out_dir(bag_path: Path, out_arg: Optional[Path]) -> Path:
+    """
+    Determine base output directory based on bag_path and out_arg.
+    Creates first_* directory for perception_data_* directories if out_arg is not provided.
+    """
+    if out_arg:
+        return out_arg.resolve()
+    
+    if _is_perception_data_dir(bag_path):
+        # Create first_* directory in parent directory
+        first_dir_name = _get_first_dir_name(bag_path)
+        first_dir = bag_path.parent / first_dir_name
+        first_dir.mkdir(parents=True, exist_ok=True)
+        return first_dir.resolve()
+    
+    # For non-perception_data_* directories, use mcap_extracted
+    if bag_path.is_dir():
+        return (bag_path / "mcap_extracted").resolve()
+    
+    # For single files, use parent/raw_data
+    return (bag_path.parent / "raw_data").resolve()
+
+
 def _find_perception_data_dirs(search_dir: Path) -> list[Path]:
     """Find all perception_data_* directories in the search directory."""
     perception_dirs = []
     for item in search_dir.iterdir():
-       if item.is_dir() and item.name.startswith("perception_data_"):
+        if item.is_dir() and item.name.startswith("perception_data_"):
             perception_dirs.append(item)
     return sorted(perception_dirs)
 
@@ -658,6 +681,105 @@ def _process_single_mcap(
         quiet=quiet,
     )
     return (mcap_file, success, error_msg)
+
+
+def _process_mcap_files(
+    mcap_files: list[Path],
+    base_out_dir: Path,
+    filters: TopicFilters,
+    args: argparse.Namespace,
+    use_mcap_name_as_dir: bool = False,
+) -> int:
+    """
+    Process a list of mcap files (parallel or sequential).
+    Returns the number of successfully processed files.
+    """
+    if not mcap_files:
+        return 0
+    
+    # Pre-create directories to reduce file system contention during parallel processing
+    if use_mcap_name_as_dir:
+        for mcap_file in mcap_files:
+            mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
+            mcap_dir = base_out_dir / mcap_dir_name
+            raw_data_dir = mcap_dir / "raw_data"
+            _safe_mkdir(raw_data_dir)
+    
+    num_jobs = args.jobs if args.jobs is not None else multiprocessing.cpu_count()
+    use_parallel = num_jobs > 1 and len(mcap_files) > 1
+    
+    if use_parallel:
+        if not args.quiet:
+            print(f"[INFO] Processing {len(mcap_files)} files with {num_jobs} parallel jobs...")
+        with multiprocessing.Pool(processes=num_jobs) as pool:
+            results = pool.starmap(
+                _process_single_mcap,
+                [
+                    (
+                        mcap_file,
+                        base_out_dir,
+                        filters,
+                        args.overwrite,
+                        args.every_n,
+                        args.max_total,
+                        args.max_per_topic,
+                        args.progress_seconds,
+                        args.quiet,
+                        use_mcap_name_as_dir,
+                    )
+                    for mcap_file in sorted(mcap_files)
+                ],
+            )
+        
+        success_count = 0
+        for mcap_file, success, error_msg in results:
+            if success:
+                if not args.quiet:
+                    print(f"[OK] {mcap_file.name}")
+                success_count += 1
+            else:
+                print(f"[ERROR] {mcap_file.name}: {error_msg}", file=sys.stderr)
+        return success_count
+    else:
+        # Sequential processing
+        success_count = 0
+        for mcap_file in sorted(mcap_files):
+            try:
+                mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
+                if not args.quiet:
+                    if use_mcap_name_as_dir:
+                        print(f"[INFO] Processing: {mcap_file.name} -> {mcap_dir_name}/raw_data")
+                    else:
+                        print(f"[INFO] Processing: {mcap_file.name}")
+                
+                success, error_msg = _process_single_mcap(
+                    mcap_file,
+                    base_out_dir,
+                    filters,
+                    args.overwrite,
+                    args.every_n,
+                    args.max_total,
+                    args.max_per_topic,
+                    args.progress_seconds,
+                    args.quiet,
+                    use_mcap_name_as_dir,
+                )
+                if success:
+                    if not args.quiet:
+                        if use_mcap_name_as_dir:
+                            mcap_dir = base_out_dir / mcap_dir_name
+                            raw_data_dir = mcap_dir / "raw_data"
+                            print(f"[OK] Export complete: {raw_data_dir}")
+                        else:
+                            out_dir = base_out_dir / mcap_dir_name
+                            print(f"[OK] Export complete: {out_dir}")
+                    success_count += 1
+                else:
+                    print(f"[ERROR] Failed: {error_msg}", file=sys.stderr)
+            except Exception as e:
+                print(f"[ERROR] Failed to process {mcap_file.name}: {e}", file=sys.stderr)
+                continue
+        return success_count
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -791,95 +913,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print(f"    - {mf.name}")
                 
                 # Determine base output directory
-                if args.out:
-                    base_out_dir = args.out.resolve()
-                else:
-                    # Create first_* directory in parent directory
-                    first_dir_name = _get_first_dir_name(bag_path)
-                    first_dir = bag_path.parent / first_dir_name
-                    first_dir.mkdir(parents=True, exist_ok=True)
-                    # Use first_dir as base, each mcap will create raw_data_N inside it
-                    base_out_dir = first_dir.resolve()
+                base_out_dir = _get_base_out_dir(bag_path, args.out)
+                if not args.out:
                     print(f"  [INFO] Output directory: {base_out_dir}")
                 
                 # Process each mcap file (parallel or sequential)
-                # Each mcap file gets its own directory named after the mcap file, with raw_data inside
-                # Pre-create all directories to reduce file system contention during parallel processing
-                if not args.out:
-                    for mcap_file in mcap_files:
-                        mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
-                        mcap_dir = base_out_dir / mcap_dir_name
-                        raw_data_dir = mcap_dir / "raw_data"
-                        _safe_mkdir(raw_data_dir)
-                
-                num_jobs = args.jobs if args.jobs is not None else multiprocessing.cpu_count()
-                use_parallel = num_jobs > 1 and len(mcap_files) > 1
-                
-                if use_parallel:
-                    print(f"  [INFO] Processing {len(mcap_files)} files with {num_jobs} parallel jobs...")
-                    with multiprocessing.Pool(processes=num_jobs) as pool:
-                        results = pool.starmap(
-                            _process_single_mcap,
-                            [
-                                (
-                                    mcap_file,
-                                    base_out_dir,
-                                    filters,
-                                    args.overwrite,
-                                    args.every_n,
-                                    args.max_total,
-                                    args.max_per_topic,
-                                    args.progress_seconds,
-                                    args.quiet,
-                                    True,  # use_mcap_name_as_dir=True
-                                )
-                                for mcap_file in mcap_files
-                            ],
-                        )
-                    
-                    dir_success = 0
-                    for mcap_file, success, error_msg in results:
-                        if success:
-                            if not args.quiet:
-                                print(f"  [OK] {mcap_file.name}")
-                            dir_success += 1
-                            total_success += 1
-                        else:
-                            print(f"  [ERROR] {mcap_file.name}: {error_msg}", file=sys.stderr)
-                else:
-                    # Sequential processing
-                    dir_success = 0
-                    for mcap_file in mcap_files:
-                        try:
-                            mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
-                            if not args.quiet:
-                                print(f"  [INFO] Processing: {mcap_file.name} -> {mcap_dir_name}/raw_data")
-                            
-                            # Each mcap file gets its own directory named after the mcap file, with raw_data inside
-                            success, error_msg = _process_single_mcap(
-                                mcap_file,
-                                base_out_dir,
-                                filters,
-                                args.overwrite,
-                                args.every_n,
-                                args.max_total,
-                                args.max_per_topic,
-                                args.progress_seconds,
-                                args.quiet,
-                                True,  # use_mcap_name_as_dir=True
-                            )
-                            if success:
-                                if not args.quiet:
-                                    mcap_dir = base_out_dir / mcap_dir_name
-                                    raw_data_dir = mcap_dir / "raw_data"
-                                    print(f"  [OK] Export complete: {raw_data_dir}")
-                                dir_success += 1
-                                total_success += 1
-                            else:
-                                print(f"  [ERROR] Failed: {error_msg}", file=sys.stderr)
-                        except Exception as e:
-                            print(f"  [ERROR] Failed to process {mcap_file.name}: {e}", file=sys.stderr)
-                            continue
+                dir_success = _process_mcap_files(
+                    mcap_files,
+                    base_out_dir,
+                    filters,
+                    args,
+                    use_mcap_name_as_dir=True,
+                )
+                total_success += dir_success
                 
                 total_mcap_files += len(mcap_files)
                 print(f"  [SUMMARY] {dir_success}/{len(mcap_files)} mcap files processed successfully in {bag_path}\n")
@@ -907,7 +953,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.out:
                 out_dir = args.out.resolve()
             else:
-                out_dir = (bag_path.parent / "raw_data" / bag_path.stem).resolve()
+                # Check if mcap file is in a perception_data_* directory
+                parent_dir = bag_path.parent
+                if _is_perception_data_dir(parent_dir):
+                    # Create first_* directory in parent's parent directory
+                    base_out_dir = _get_base_out_dir(parent_dir, None)
+                    # Create mcap_name/raw_data structure inside first_* directory
+                    mcap_dir_name = _sanitize_dir_component(bag_path.stem)
+                    mcap_dir = base_out_dir / mcap_dir_name
+                    out_dir = mcap_dir / "raw_data"
+                    print(f"[INFO] Output directory: {out_dir}")
+                else:
+                    # Fallback to original behavior
+                    out_dir = (bag_path.parent / "raw_data" / bag_path.stem).resolve()
             if out_dir.exists() and not out_dir.is_dir():
                 print(f"[ERROR] --out exists but is not a directory: {out_dir}", file=sys.stderr)
                 return 2
@@ -943,107 +1001,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             print()
             
             # Determine base output directory
-            if args.out:
-                base_out_dir = args.out.resolve()
-            else:
-                # Check if it's a perception_data_* directory
-                if bag_path.name.startswith("perception_data_") and not bag_path.name.endswith("_csv"):
-                    # Create first_* directory in parent directory
-                    first_dir_name = _get_first_dir_name(bag_path)
-                    first_dir = bag_path.parent / first_dir_name
-                    first_dir.mkdir(parents=True, exist_ok=True)
-                    # Use first_dir as base, each mcap will create its own directory with raw_data inside
-                    base_out_dir = first_dir.resolve()
-                    print(f"[INFO] Output directory: {base_out_dir}")
-                    # Pre-create all directories to reduce file system contention during parallel processing
-                    for mcap_file in mcap_files:
-                        mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
-                        mcap_dir = base_out_dir / mcap_dir_name
-                        raw_data_dir = mcap_dir / "raw_data"
-                        _safe_mkdir(raw_data_dir)
-                else:
-                    # For non-perception_data_* directories, use mcap_extracted
-                    base_out_dir = (bag_path / "mcap_extracted").resolve()
-            
-            # Process each mcap file (parallel or sequential)
-            num_jobs = args.jobs if args.jobs is not None else multiprocessing.cpu_count()
-            use_parallel = num_jobs > 1 and len(mcap_files) > 1
+            base_out_dir = _get_base_out_dir(bag_path, args.out)
+            if not args.out:
+                print(f"[INFO] Output directory: {base_out_dir}")
             
             # Check if we should use mcap name as directory (for perception_data_* directories)
-            use_mcap_name = (not args.out and 
-                            bag_path.name.startswith("perception_data_") and 
-                            not bag_path.name.endswith("_csv"))
+            use_mcap_name = not args.out and _is_perception_data_dir(bag_path)
             
-            if use_parallel:
-                print(f"[INFO] Processing {len(mcap_files)} files with {num_jobs} parallel jobs...")
-                with multiprocessing.Pool(processes=num_jobs) as pool:
-                    results = pool.starmap(
-                        _process_single_mcap,
-                        [
-                            (
-                                mcap_file,
-                                base_out_dir,
-                                filters,
-                                args.overwrite,
-                                args.every_n,
-                                args.max_total,
-                                args.max_per_topic,
-                                args.progress_seconds,
-                                args.quiet,
-                                use_mcap_name,  # use_mcap_name_as_dir
-                            )
-                            for mcap_file in mcap_files
-                        ],
-                    )
-                
-                success_count = 0
-                for mcap_file, success, error_msg in results:
-                    if success:
-                        if not args.quiet:
-                            print(f"[OK] {mcap_file.name}")
-                        success_count += 1
-                    else:
-                        print(f"[ERROR] {mcap_file.name}: {error_msg}", file=sys.stderr)
-            else:
-                # Sequential processing
-                success_count = 0
-                for mcap_file in mcap_files:
-                    try:
-                        mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
-                        if not args.quiet:
-                            if use_mcap_name:
-                                print(f"[INFO] Processing: {mcap_file.name} -> {mcap_dir_name}/raw_data")
-                            else:
-                                print(f"[INFO] Processing: {mcap_file.name}")
-                        
-                        # Use _process_single_mcap for consistent behavior
-                        success, error_msg = _process_single_mcap(
-                            mcap_file,
-                            base_out_dir,
-                            filters,
-                            args.overwrite,
-                            args.every_n,
-                            args.max_total,
-                            args.max_per_topic,
-                            args.progress_seconds,
-                            args.quiet,
-                            use_mcap_name,  # use_mcap_name_as_dir
-                        )
-                        if success:
-                            if not args.quiet:
-                                if use_mcap_name:
-                                    mcap_dir = base_out_dir / mcap_dir_name
-                                    raw_data_dir = mcap_dir / "raw_data"
-                                    print(f"[OK] Export complete: {raw_data_dir}")
-                                else:
-                                    out_dir = base_out_dir / mcap_dir_name
-                                    print(f"[OK] Export complete: {out_dir}")
-                            success_count += 1
-                        else:
-                            print(f"[ERROR] Failed: {error_msg}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"[ERROR] Failed to process {mcap_file.name}: {e}", file=sys.stderr)
-                        continue
+            # Process each mcap file (parallel or sequential)
+            success_count = _process_mcap_files(
+                mcap_files,
+                base_out_dir,
+                filters,
+                args,
+                use_mcap_name_as_dir=use_mcap_name,
+            )
             
             print(f"\n[SUMMARY] Successfully processed {success_count}/{len(mcap_files)} mcap files")
             return 0 if success_count == len(mcap_files) else 1
@@ -1059,107 +1031,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print()
                 
                 # Determine base output directory
-                if args.out:
-                    base_out_dir = args.out.resolve()
-                else:
-                    # Check if it's a perception_data_* directory
-                    if bag_path.name.startswith("perception_data_") and not bag_path.name.endswith("_csv"):
-                        # Create first_* directory in parent directory
-                        first_dir_name = _get_first_dir_name(bag_path)
-                        first_dir = bag_path.parent / first_dir_name
-                        first_dir.mkdir(parents=True, exist_ok=True)
-                        # Use first_dir as base, each mcap will create its own directory with raw_data inside
-                        base_out_dir = first_dir.resolve()
-                        print(f"[INFO] Output directory: {base_out_dir}")
-                        # Pre-create all directories to reduce file system contention during parallel processing
-                        for mcap_file in mcap_files:
-                            mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
-                            mcap_dir = base_out_dir / mcap_dir_name
-                            raw_data_dir = mcap_dir / "raw_data"
-                            _safe_mkdir(raw_data_dir)
-                    else:
-                        # For non-perception_data_* directories, use mcap_extracted
-                        base_out_dir = (bag_path / "mcap_extracted").resolve()
+                base_out_dir = _get_base_out_dir(bag_path, args.out)
+                if not args.out:
+                    print(f"[INFO] Output directory: {base_out_dir}")
                 
                 # Check if we should use mcap name as directory (for perception_data_* directories)
-                use_mcap_name = (not args.out and 
-                                bag_path.name.startswith("perception_data_") and 
-                                not bag_path.name.endswith("_csv"))
+                use_mcap_name = not args.out and _is_perception_data_dir(bag_path)
                 
                 # Process each mcap file (parallel or sequential)
-                num_jobs = args.jobs if args.jobs is not None else multiprocessing.cpu_count()
-                use_parallel = num_jobs > 1 and len(mcap_files) > 1
-                
-                if use_parallel:
-                    print(f"[INFO] Processing {len(mcap_files)} files with {num_jobs} parallel jobs...")
-                    with multiprocessing.Pool(processes=num_jobs) as pool:
-                        results = pool.starmap(
-                            _process_single_mcap,
-                            [
-                                (
-                                    mcap_file,
-                                    base_out_dir,
-                                    filters,
-                                    args.overwrite,
-                                    args.every_n,
-                                    args.max_total,
-                                    args.max_per_topic,
-                                    args.progress_seconds,
-                                    args.quiet,
-                                    use_mcap_name,  # use_mcap_name_as_dir
-                                )
-                                for mcap_file in sorted(mcap_files)
-                            ],
-                        )
-                    
-                    success_count = 0
-                    for mcap_file, success, error_msg in results:
-                        if success:
-                            if not args.quiet:
-                                print(f"[OK] {mcap_file.name}")
-                            success_count += 1
-                        else:
-                            print(f"[ERROR] {mcap_file.name}: {error_msg}", file=sys.stderr)
-                else:
-                    # Sequential processing
-                    success_count = 0
-                    for mcap_file in sorted(mcap_files):
-                        try:
-                            mcap_dir_name = _sanitize_dir_component(mcap_file.stem)
-                            if not args.quiet:
-                                if use_mcap_name:
-                                    print(f"[INFO] Processing: {mcap_file.name} -> {mcap_dir_name}/raw_data")
-                                else:
-                                    print(f"[INFO] Processing: {mcap_file.name}")
-                            
-                            # Use _process_single_mcap for consistent behavior
-                            success, error_msg = _process_single_mcap(
-                                mcap_file,
-                                base_out_dir,
-                                filters,
-                                args.overwrite,
-                                args.every_n,
-                                args.max_total,
-                                args.max_per_topic,
-                                args.progress_seconds,
-                                args.quiet,
-                                use_mcap_name,  # use_mcap_name_as_dir
-                            )
-                            if success:
-                                if not args.quiet:
-                                    if use_mcap_name:
-                                        mcap_dir = base_out_dir / mcap_dir_name
-                                        raw_data_dir = mcap_dir / "raw_data"
-                                        print(f"[OK] Export complete: {raw_data_dir}")
-                                    else:
-                                        out_dir = base_out_dir / mcap_dir_name
-                                        print(f"[OK] Export complete: {out_dir}")
-                                success_count += 1
-                            else:
-                                print(f"[ERROR] Failed: {error_msg}", file=sys.stderr)
-                        except Exception as e:
-                            print(f"[ERROR] Failed to process {mcap_file.name}: {e}", file=sys.stderr)
-                            continue
+                success_count = _process_mcap_files(
+                    sorted(mcap_files),
+                    base_out_dir,
+                    filters,
+                    args,
+                    use_mcap_name_as_dir=use_mcap_name,
+                )
                 
                 print(f"\n[SUMMARY] Successfully processed {success_count}/{len(mcap_files)} mcap files")
                 return 0 if success_count == len(mcap_files) else 1

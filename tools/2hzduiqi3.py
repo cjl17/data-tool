@@ -198,16 +198,16 @@ def main():
     # ============ 修复：遍历所有first_*目录，而不是只取第一个 ============
     for first_dir in first_dirs:
         logging.info(f"处理 first 目录: {first_dir.name}")
-        
+
         for p in sorted(first_dir.glob("perception_data_*")):
-            raw = p / "raw_data"
-            if not raw.exists():
-                continue
+        raw = p / "raw_data"
+        if not raw.exists():
+            continue
 
             logging.info(f"  处理 perception_data: {p.name}")
             try:
-                proc = AQLoopPreprocessor(raw)
-                proc.run(p)
+        proc = AQLoopPreprocessor(raw)
+        proc.run(p)
                 logging.info(f"  完成: {p.name}")
             except Exception as e:
                 logging.error(f"  处理失败 {p.name}: {e}")
